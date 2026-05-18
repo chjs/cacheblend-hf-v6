@@ -72,9 +72,15 @@ class MusiqueCase:
 # Default templates.
 # ---------------------------------------------------------------------------
 DEFAULT_PREFIX = (
-    "You are a helpful question-answering assistant. Use the provided "
-    "passages to answer the final question concisely. The passages may "
-    "appear in arbitrary order."
+    # MuSiQue gold answers are mostly short factoid spans; long-form
+    # explanations from the model would tank F1 precision because of
+    # the extra tokens. We instruct for a short direct answer but
+    # deliberately avoid hard word-count constraints like "exactly 3
+    # words" — some valid MuSiQue answers exceed 3 tokens and a hard
+    # cap would clip them.
+    "You are a question-answering assistant. Use the provided passages "
+    "to answer the final question. Answer with only the final answer. "
+    "Use the shortest possible phrase. Do not explain."
 )
 
 DEFAULT_QUESTION_TEMPLATE = "Question: {question}\n\nAnswer:"
