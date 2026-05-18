@@ -1,0 +1,13 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 10 items / 8 deselected / 2 selected
+
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Meta-Llama-3.1-8B-Instruct-fp16] PASSED [ 50%]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_final_hidden_allclose[Meta-Llama-3.1-8B-Instruct-fp16] PASSED [100%]
+
+======================= 2 passed, 8 deselected in 59.87s =======================

@@ -1,0 +1,25 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 16 items / 11 deselected / 5 selected
+
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 20%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_2_yield_count[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 40%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_3_final_hidden_shape[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 60%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_4_memory_smoke[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 80%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_5_process_qkv_per_layer_with_rope[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [100%]
+
+=============================== warnings summary ===============================
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[meta-llama/Meta-Llama-3.1-8B-Instruct]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[meta-llama/Meta-Llama-3.1-8B-Instruct]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[meta-llama/Meta-Llama-3.1-8B-Instruct]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[meta-llama/Meta-Llama-3.1-8B-Instruct]
+  /usr/local/lib/python3.12/dist-packages/huggingface_hub/file_download.py:1842: DeprecationWarning: hf_xet.download_files() is deprecated. Use XetSession().new_file_download_group().start_download_file() instead.
+    xet_get(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========== 5 passed, 11 deselected, 4 warnings in 74.26s (0:01:14) ============
