@@ -109,7 +109,11 @@ class LayerCacheEngineKey(CacheEngineKey):
     def __eq__(self, other):
         if not isinstance(other, LayerCacheEngineKey):
             return False
-        return super().__eq__(other) and self.layer_id == other.layer_id
+        # CacheEngineKey.__eq__(self, other) explicitly — Python 3.12.x
+        # slotted-dataclass inheritance can mis-resolve `super()` inside
+        # `__eq__` and raise
+        #   TypeError: super(type, obj): obj must be an instance or subtype of type.
+        return CacheEngineKey.__eq__(self, other) and self.layer_id == other.layer_id
 
 
 # -----------------------------------------------------------------------------
