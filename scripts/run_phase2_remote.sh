@@ -59,24 +59,32 @@ print('HF login OK')
 echo "=== Phase 2 tests ==="
 export LMC_PHASE2_REAL_MODELS=1
 
-echo "--- pass 1: tiny + Mistral-7B (fp32 / fp16 / bf16) ---"
-python -m pytest tests/test_phase2_equivalence.py -v \
-    -k "TinyModel or Mistral-7B-Instruct-v0.2" 2>&1 \
-    | tee "$RESULTS/phase2_pytest_mistral.log"
-RC1=${PIPESTATUS[0]}
+# Run each (model, dtype) cell in a *separate* pytest process so the
+# previous cell's 14-16 GB of model weights is reclaimed by process
+# exit. Phase 1 confirmed that in-process fixture teardown can't be
+# trusted to fully release VRAM on a 24 GB GPU; the per-process split
+# is the reliable pattern. Extra cost is ~10 s of pytest startup per
+# cell, vastly cheaper than another vast.ai run.
+declare -i FAIL=0
 
-echo "--- pass 2: Llama-3.1-8B (fresh process; fp32 / fp16 / bf16) ---"
-python -m pytest tests/test_phase2_equivalence.py -v \
-    -k "Meta-Llama-3.1-8B-Instruct" 2>&1 \
-    | tee "$RESULTS/phase2_pytest_llama.log"
-RC2=${PIPESTATUS[0]}
+run_one() {
+    local k="$1"
+    local out="$2"
+    echo "--- $k ---"
+    python -m pytest tests/test_phase2_equivalence.py -v -k "$k" 2>&1 | tee "$out"
+    local rc=${PIPESTATUS[0]}
+    echo "rc=$rc for $k"
+    [ "$rc" = "0" ] || FAIL=1
+}
 
-if [ "$RC1" = "0" ] && [ "$RC2" = "0" ]; then
-    PYTEST_RC=0
-else
-    PYTEST_RC=1
-fi
-echo "pytest rc=$PYTEST_RC (mistral=$RC1 llama=$RC2)"
+# Tiny CPU regression — shares process with Mistral-fp16 (cheap).
+run_one "TinyModel or Mistral-7B-Instruct-v0.2 and float16" "$RESULTS/phase2_pytest_mistral_fp16.log"
+run_one "Mistral-7B-Instruct-v0.2 and bfloat16"             "$RESULTS/phase2_pytest_mistral_bf16.log"
+run_one "Meta-Llama-3.1-8B-Instruct and float16"            "$RESULTS/phase2_pytest_llama_fp16.log"
+run_one "Meta-Llama-3.1-8B-Instruct and bfloat16"           "$RESULTS/phase2_pytest_llama_bf16.log"
+
+PYTEST_RC=$FAIL
+echo "pytest combined rc=$PYTEST_RC"
 
 echo "=== nvidia-smi after run ==="
 nvidia-smi || true
