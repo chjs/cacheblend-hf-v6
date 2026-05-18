@@ -35,3 +35,8 @@ Thumbs.db
 
 # Reference checkout (not part of this repo)
 LMCache_reference/
+
+# Credentials — never commit
+.env
+.env.*
+!.env.example
