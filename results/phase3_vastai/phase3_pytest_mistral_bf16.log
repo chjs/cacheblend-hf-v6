@@ -1,0 +1,13 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 18 items / 16 deselected / 2 selected
+
+tests/test_phase3_blender.py::TestRealModelBlend::test_round_trip_fused_rope[Mistral-7B-Instruct-v0.2-bf16] PASSED [ 50%]
+tests/test_phase3_blender.py::TestRealModelBlend::test_realistic_blend[Mistral-7B-Instruct-v0.2-bf16] PASSED [100%]
+
+================= 2 passed, 16 deselected in 63.09s (0:01:03) ==================

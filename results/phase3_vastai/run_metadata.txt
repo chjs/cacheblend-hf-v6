@@ -1,0 +1,25 @@
+Phase 3 verification run
+========================
+Date (UTC): 2026-05-18T14:46:50Z
+vast.ai instance: 37012144 (offer 36975523, machine 12840)
+GPU: NVIDIA RTX 3090 Ti (24 GB VRAM)
+Host: ssh4.vast.ai:12144
+Offer price: $0.2244/hr
+Image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+
+Commit tested: b0dce0a
+Pytest cells: 4
+Total real-model wall: ~10 minutes
+Cost: ~$1.48 (credit $17.36 → $15.88; one failed run included)
+
+Results:
+  Tiny CPU (fp32): 10/10 PASS
+  Mistral-7B-Instruct-v0.2 fp16: 2/2 PASS
+  Mistral-7B-Instruct-v0.2 bf16: 2/2 PASS
+  Meta-Llama-3.1-8B-Instruct fp16: 2/2 PASS
+  Meta-Llama-3.1-8B-Instruct bf16: 2/2 PASS
+
+  Total: 18/18 PASS
+
+Phase 0 audit risk #1 (Llama-3 RoPE round-trip) resolved by §3.2
+fp32 tolerance 1e-4 PASS on Llama-3.1-8B.
