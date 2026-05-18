@@ -1,0 +1,23 @@
+[project]
+name = "cacheblend-hf"
+version = "0.0.1"
+description = "Port of LMCache CacheBlend to HuggingFace Transformers"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=5.7",
+    "accelerate",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+phase4 = ["datasets"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lmc*"]
