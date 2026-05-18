@@ -247,6 +247,59 @@ def _build_cacheblend_pipeline(
 # ---------------------------------------------------------------------------
 # Segment cache-hit diagnostic.
 # ---------------------------------------------------------------------------
+def _compute_cache_hit_end(engine, second_prompt_ids: torch.Tensor) -> int:
+    """
+    Walk the SegmentTokenDatabase over the second prompt and return the
+    end position of the LAST cache-hit segment (i.e. the position where
+    the first cache MISS starts). Returns 0 if even the first segment
+    misses.
+
+    This boundary is where the blender's prefill must stop. Tokens past
+    this position must be prefilled by stock HF forward (since
+    CacheBlend's connector buffer can only cover positions up to the
+    last cache hit).
+    """
+    token_db = engine.token_database
+    num_layers = engine.num_layers
+    second_cpu = second_prompt_ids.detach().to(device="cpu", dtype=torch.long)
+    last_hit_end = 0
+    for start, end, key in token_db.process_tokens(tokens=second_cpu):
+        layer_keys = key.split_layers(num_layers)
+        if engine.storage.contains(layer_keys[0]):
+            last_hit_end = int(end)
+        else:
+            break
+    return last_hit_end
+
+
+@torch.no_grad()
+def _manual_prefill_extend(
+    model,
+    *,
+    tail_ids: torch.Tensor,         # 1-D long tensor on device
+    base_cache,                     # DynamicCache with seq_len = prefix_len
+    prefix_len: int,
+) -> "DynamicCache":
+    """
+    Run stock HF forward on `tail_ids` starting from `base_cache`.
+    Returns the extended cache (length = prefix_len + tail_ids.numel()).
+    Model must be UNPATCHED at entry.
+    """
+    device = next(model.parameters()).device
+    L_tail = int(tail_ids.numel())
+    position_ids = torch.arange(
+        prefix_len, prefix_len + L_tail, dtype=torch.long, device=device,
+    ).view(1, -1)
+    out = model(
+        input_ids=tail_ids.view(1, -1),
+        past_key_values=base_cache,
+        position_ids=position_ids,
+        use_cache=True,
+        return_dict=True,
+    )
+    return out.past_key_values
+
+
 def _diagnose_segment_hits(
     engine,
     *,
@@ -372,12 +425,25 @@ def _run_cache_method(
             materialized=materialized,
         )
 
-    # ----- Evaluation prefill on the SECOND prompt -----
+    # ----- Decide blender vs. miss-tail split -----
+    # The connector buffer can only cover positions up to the last cache
+    # hit. Find that boundary and split the second prompt accordingly.
+    L_full = int(second_prompt_ids.numel())
+    cache_end = _compute_cache_hit_end(engine, second_prompt_ids)
+    if cache_end <= 0:
+        raise RuntimeError(
+            "second prompt has no cache hits — warmup failed or sep/prefix "
+            "mismatched. Cannot run cache method."
+        )
+    blender_input_ids = second_prompt_ids[:cache_end]
+    miss_tail_ids = second_prompt_ids[cache_end:]   # may be empty
+
+    # ----- Evaluation prefill on the cache-hit prefix -----
     cuda = device.type == "cuda"
     if cuda:
         torch.cuda.synchronize()
     t0 = time.time()
-    blender.blend(second_prompt_ids)
+    blender.blend(blender_input_ids)
     if cuda:
         torch.cuda.synchronize()
     prefill_ms = (time.time() - t0) * 1000.0
@@ -396,6 +462,27 @@ def _run_cache_method(
     )
 
     unpatch_hf_model(model)
+
+    # ----- Manual prefill of the miss tail (sep + real question) onto
+    # the fused cache so it covers the full second prompt. -----
+    if int(miss_tail_ids.numel()) > 0:
+        if cuda:
+            torch.cuda.synchronize()
+        t_tail = time.time()
+        fused_cache = _manual_prefill_extend(
+            model,
+            tail_ids=miss_tail_ids,
+            base_cache=fused_cache,
+            prefix_len=cache_end,
+        )
+        if cuda:
+            torch.cuda.synchronize()
+        prefill_ms += (time.time() - t_tail) * 1000.0
+
+    assert fused_cache.get_seq_length() == L_full, (
+        f"cache length {fused_cache.get_seq_length()} != prompt length {L_full} "
+        f"(cache_end={cache_end}, tail_len={int(miss_tail_ids.numel())})"
+    )
 
     text, gen_ids = decode_from_full_cache(
         model, tokenizer, second_prompt_ids, fused_cache, max_new_tokens,
