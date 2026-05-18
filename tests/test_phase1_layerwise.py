@@ -257,11 +257,15 @@ REAL_MODEL_NAMES = [
         "Tiny-model tests cover the same code paths on CPU."
     ),
 )
-@pytest.mark.parametrize("model_name", REAL_MODEL_NAMES)
 class TestRealModelLayerwise:
 
-    @pytest.fixture(scope="class")
-    def real_run(self, model_name):
+    # Class-scoped fixture that loads each model once and shares the run
+    # across all five criteria tests. `params=` on the fixture itself
+    # parametrizes at class scope (function-scope @parametrize on the
+    # class would mismatch scopes here).
+    @pytest.fixture(scope="class", params=REAL_MODEL_NAMES)
+    def real_run(self, request):
+        model_name = request.param
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
