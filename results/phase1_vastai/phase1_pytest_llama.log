@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 16 items / 11 deselected / 5 selected
+
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 20%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_2_yield_count[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 40%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_3_final_hidden_shape[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 60%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_4_memory_smoke[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [ 80%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_5_process_qkv_per_layer_with_rope[meta-llama/Meta-Llama-3.1-8B-Instruct] PASSED [100%]
+
+================= 5 passed, 11 deselected in 60.03s (0:01:00) ==================

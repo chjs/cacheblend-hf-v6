@@ -55,10 +55,28 @@ print('HF login OK')
 
 echo "=== Phase 1 tests ==="
 export LMC_PHASE1_REAL_MODELS=1
-# Capture both pytest output and a summary for the report.
-python -m pytest tests/test_phase1_layerwise.py -v 2>&1 | tee "$RESULTS/phase1_pytest.log"
-PYTEST_RC=${PIPESTATUS[0]}
-echo "pytest rc=$PYTEST_RC"
+# Run tiny + Mistral in one process, then Llama in a *fresh* Python
+# process so Mistral's GPU memory is fully reclaimed by process exit.
+# The class-scoped pytest fixture's in-process teardown was leaving
+# ~14 GB of Mistral resident on the 24 GB GPU, causing Llama-3.1's
+# `.to('cuda:0')` to OOM in a single-invocation run. Splitting by `-k`
+# sidesteps that entirely; it's worth ~10 s of redundant pytest startup.
+echo "--- pass 1: tiny + Mistral-7B ---"
+python -m pytest tests/test_phase1_layerwise.py -v \
+    -k "TinyModel or Mistral-7B" 2>&1 | tee "$RESULTS/phase1_pytest_mistral.log"
+RC1=${PIPESTATUS[0]}
+
+echo "--- pass 2: Llama-3.1-8B (fresh process) ---"
+python -m pytest tests/test_phase1_layerwise.py -v \
+    -k "Meta-Llama-3.1" 2>&1 | tee "$RESULTS/phase1_pytest_llama.log"
+RC2=${PIPESTATUS[0]}
+
+if [ "$RC1" = "0" ] && [ "$RC2" = "0" ]; then
+    PYTEST_RC=0
+else
+    PYTEST_RC=1
+fi
+echo "pytest rc=$PYTEST_RC (mistral=$RC1 llama=$RC2)"
 
 echo "=== nvidia-smi after run ==="
 nvidia-smi || true

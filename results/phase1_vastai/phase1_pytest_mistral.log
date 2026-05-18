@@ -1,0 +1,22 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 16 items / 5 deselected / 11 selected
+
+tests/test_phase1_layerwise.py::TestTinyModelLayerwise::test_criterion_1_runs_without_raising PASSED [  9%]
+tests/test_phase1_layerwise.py::TestTinyModelLayerwise::test_criterion_2_yields_exactly_num_hidden_layers PASSED [ 18%]
+tests/test_phase1_layerwise.py::TestTinyModelLayerwise::test_criterion_3_final_hidden_state_shape PASSED [ 27%]
+tests/test_phase1_layerwise.py::TestTinyModelLayerwise::test_criterion_5_process_qkv_per_layer_with_rope PASSED [ 36%]
+tests/test_phase1_layerwise.py::TestTinyModelLayerwise::test_blend_metadata_dataclass_shape PASSED [ 45%]
+tests/test_phase1_layerwise.py::TestTinyModelLayerwise::test_double_construction_idempotent PASSED [ 54%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_1_runs[mistralai/Mistral-7B-Instruct-v0.2] PASSED [ 63%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_2_yield_count[mistralai/Mistral-7B-Instruct-v0.2] PASSED [ 72%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_3_final_hidden_shape[mistralai/Mistral-7B-Instruct-v0.2] PASSED [ 81%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_4_memory_smoke[mistralai/Mistral-7B-Instruct-v0.2] PASSED [ 90%]
+tests/test_phase1_layerwise.py::TestRealModelLayerwise::test_criterion_5_process_qkv_per_layer_with_rope[mistralai/Mistral-7B-Instruct-v0.2] PASSED [100%]
+
+====================== 11 passed, 5 deselected in 56.14s =======================

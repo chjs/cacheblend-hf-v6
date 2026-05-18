@@ -40,3 +40,4 @@ LMCache_reference/
 .env
 .env.*
 !.env.example
+_vastai_run.sh

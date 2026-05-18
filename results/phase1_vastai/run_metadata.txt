@@ -1,0 +1,9 @@
+Run started: 2026-05-18T13:04:37Z
+vast.ai instance: 37007648
+GPU: NVIDIA RTX A5000 (24 GB VRAM)
+Host: ssh8.vast.ai:17648 / 93.91.156.90
+Offer price: $0.2206/hr
+Image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+Disk: 40 GB
+Commit tested: fd80b914185886a95e22d792932df74c18a6e582
+Test command: LMC_PHASE1_REAL_MODELS=1 pytest tests/test_phase1_layerwise.py -v
