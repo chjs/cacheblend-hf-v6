@@ -1,0 +1,22 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 10 items / 8 deselected / 2 selected
+
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Meta-Llama-3.1-8B-Instruct-fp16] PASSED [ 50%]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_final_hidden_allclose[Meta-Llama-3.1-8B-Instruct-fp16] PASSED [100%]
+
+=============================== warnings summary ===============================
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Meta-Llama-3.1-8B-Instruct-fp16]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Meta-Llama-3.1-8B-Instruct-fp16]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Meta-Llama-3.1-8B-Instruct-fp16]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Meta-Llama-3.1-8B-Instruct-fp16]
+  /usr/local/lib/python3.12/dist-packages/huggingface_hub/file_download.py:1842: DeprecationWarning: hf_xet.download_files() is deprecated. Use XetSession().new_file_download_group().start_download_file() instead.
+    xet_get(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========== 2 passed, 8 deselected, 4 warnings in 112.16s (0:01:52) ============

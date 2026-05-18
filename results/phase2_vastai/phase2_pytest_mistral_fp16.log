@@ -1,0 +1,15 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 10 items / 6 deselected / 4 selected
+
+tests/test_phase2_equivalence.py::TestTinyModelEquivalence::test_kv_per_layer_allclose PASSED [ 25%]
+tests/test_phase2_equivalence.py::TestTinyModelEquivalence::test_final_hidden_allclose PASSED [ 50%]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_kv_per_layer_allclose[Mistral-7B-Instruct-v0.2-fp16] PASSED [ 75%]
+tests/test_phase2_equivalence.py::TestRealModelEquivalence::test_final_hidden_allclose[Mistral-7B-Instruct-v0.2-fp16] PASSED [100%]
+
+================== 4 passed, 6 deselected in 73.79s (0:01:13) ==================

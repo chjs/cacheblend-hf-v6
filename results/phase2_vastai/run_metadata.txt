@@ -1,0 +1,24 @@
+Phase 2 verification run
+========================
+Date (UTC): 2026-05-18T14:02:03Z
+vast.ai instance: 37009319 (offer 29302413, machine 25498)
+GPU: NVIDIA GeForce RTX 3090 (24 GB VRAM)
+Host: ssh3.vast.ai:19318
+Offer price: $0.2259/hr
+Image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+Disk: 40 GB
+
+Commit tested: 41db323
+Pytest cells: 4 (per-(model,dtype) split)
+Total pytest wall: 318.45 s
+Cost: ~$0.32 (credit $17.68 → $17.36)
+
+Results: 16/16 PASS
+  Tiny (CPU fp32): 2/2 PASS, K/V exact-equal
+  Mistral-7B fp16: 2/2 PASS
+  Mistral-7B bf16: 2/2 PASS
+  Meta-Llama-3.1-8B fp16: 2/2 PASS
+  Meta-Llama-3.1-8B bf16: 2/2 PASS
+
+  fp32 real-model: deliberately excluded — model weights ~29-32 GB
+  exceed 24 GB VRAM. tiny model exercises fp32 tolerance.
