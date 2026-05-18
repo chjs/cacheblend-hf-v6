@@ -280,8 +280,29 @@ class TestRealModelLayerwise:
         result["model"] = model
         yield result
         # Clean up GPU memory between parametrized invocations.
-        del result["model"]
-        del model
+        # The result dict keeps several handles that all chain back to
+        # the model (`lmc_model.vllm_model`, `recorder.vllm_model`,
+        # `recorder._inner.vllm_model`, etc.), so del'ing them in order
+        # is fragile. Move the model to CPU first to free VRAM
+        # unconditionally, *then* drop refs so Python can release the
+        # CPU copy at its leisure.
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+        recorder = result.get("recorder")
+        if recorder is not None:
+            recorder.vllm_model = None
+            if getattr(recorder, "_inner", None) is not None:
+                recorder._inner.vllm_model = None
+                recorder._inner.layerwise_model = None
+            recorder.layerwise_model = None
+        lmc = result.get("lmc_model")
+        if lmc is not None:
+            lmc.vllm_model = None
+            lmc.blender = None
+        result.clear()
+        del result, recorder, lmc, model
         gc.collect()
         torch.cuda.empty_cache()
 
