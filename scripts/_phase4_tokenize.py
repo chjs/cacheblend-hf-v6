@@ -7,11 +7,19 @@ stripped, then the lists are concatenated manually. Never tokenize
 the whole concatenated prompt as the source of truth (see
 docs/phases/PHASE4_PROMPT.md "Separator and CacheBlend segment
 semantics" + `examples/blend_kv_v1/blend.py:147-186`).
+
+Phase 4 rerun (2026-05): the *first* prompt ends with a `dummy_warmup
+_query` segment, the *second* prompt ends with the *real* MuSiQue
+question segment. Both prompts share prefix/separator/per-chunk token
+ids; the chunk order in the second prompt is the reverse of the
+first. Because the real question segment hashes differently from the
+dummy warmup query, the cache miss on the real question is what makes
+the F1 evaluation a real RAG-cache test.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 from scripts._phase4_musique import MusiqueCase
 
@@ -37,7 +45,8 @@ class MaterializedCase:
     # Per-segment token id lists (all post-BOS-strip).
     sep_ids: List[int]
     prefix_ids: List[int]
-    question_ids: List[int]
+    dummy_query_ids: List[int]
+    real_question_ids: List[int]
     chunk_ids_by_id: Dict[str, List[int]]
 
     # Concatenated full prompt token id lists.
@@ -88,7 +97,8 @@ def materialize(
         )
 
     prefix_ids = _encode_strip(tokenizer, case.prefix_text)
-    question_ids = _encode_strip(tokenizer, case.question_segment_text)
+    dummy_query_ids = _encode_strip(tokenizer, case.dummy_warmup_query_text)
+    real_question_ids = _encode_strip(tokenizer, case.real_question_segment_text)
 
     chunk_ids_by_id: Dict[str, List[int]] = {}
     for chunk in case.selected_chunks:
@@ -98,8 +108,10 @@ def materialize(
     bad_segments: List[str] = []
     if count_subsequence(prefix_ids, sep_ids) > 0:
         bad_segments.append("prefix")
-    if count_subsequence(question_ids, sep_ids) > 0:
-        bad_segments.append("question")
+    if count_subsequence(dummy_query_ids, sep_ids) > 0:
+        bad_segments.append("dummy_warmup_query")
+    if count_subsequence(real_question_ids, sep_ids) > 0:
+        bad_segments.append("real_question")
     for cid, ids in chunk_ids_by_id.items():
         if count_subsequence(ids, sep_ids) > 0:
             bad_segments.append(f"chunk:{cid}")
@@ -113,18 +125,18 @@ def materialize(
         return None
 
     # Concatenate per the LMCache pattern.
-    def concat(order: List[str]) -> List[int]:
+    def concat(order: List[str], tail_ids: List[int]) -> List[int]:
         out: List[int] = []
         out.extend(prefix_ids)
         out.extend(sep_ids)
         for cid in order:
             out.extend(chunk_ids_by_id[cid])
             out.extend(sep_ids)
-        out.extend(question_ids)
+        out.extend(tail_ids)
         return out
 
-    first_prompt_ids = concat(case.first_order)
-    second_prompt_ids = concat(case.second_order)
+    first_prompt_ids = concat(case.first_order, dummy_query_ids)
+    second_prompt_ids = concat(case.second_order, real_question_ids)
 
     # Sep count validation: 1 (post-prefix) + N (after each chunk) = N+1.
     expected_sep_count = 1 + len(case.first_order)
@@ -142,11 +154,18 @@ def materialize(
     assert orders_are_reverse
     assert set(case.first_order) == set(case.second_order)
 
+    # Sanity invariant — the cache-hit assumption depends on this.
+    assert dummy_query_ids != real_question_ids, (
+        "dummy warmup query and real question tokenize to identical ids "
+        "— the real question segment would be a cache hit"
+    )
+
     return MaterializedCase(
         case=case,
         sep_ids=sep_ids,
         prefix_ids=prefix_ids,
-        question_ids=question_ids,
+        dummy_query_ids=dummy_query_ids,
+        real_question_ids=real_question_ids,
         chunk_ids_by_id=chunk_ids_by_id,
         first_prompt_ids=first_prompt_ids,
         second_prompt_ids=second_prompt_ids,

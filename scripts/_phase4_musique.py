@@ -38,7 +38,15 @@ class SelectedChunk:
 
 @dataclass
 class MusiqueCase:
-    """Tokenizer-independent CacheBlend test case for one MuSiQue example."""
+    """Tokenizer-independent CacheBlend test case for one MuSiQue example.
+
+    The first prompt is a *warmup-only* prompt: it ends with
+    `dummy_warmup_query_text` instead of the real MuSiQue question, so
+    that the question segment does NOT get cached under a key that the
+    second prompt would hit. The second prompt ends with
+    `real_question_segment_text` (the actual MuSiQue question) and is
+    the *only* prompt scored for F1.
+    """
     id: str
     dataset: str
     question: str
@@ -46,7 +54,8 @@ class MusiqueCase:
     answer_aliases: List[str]
     prefix_text: str
     blend_special_str: str
-    question_segment_text: str
+    real_question_segment_text: str      # second prompt's final segment
+    dummy_warmup_query_text: str         # first prompt's final segment
     selected_chunks: List[SelectedChunk]
     first_order: List[str]          # chunk_ids in first-prompt order
     second_order: List[str]         # chunk_ids in second-prompt order
@@ -60,6 +69,15 @@ class MusiqueCase:
         )
         # Same id set.
         assert set(self.first_order) == set(self.second_order)
+        # The warmup query must differ from the real question, otherwise
+        # the real question segment would be a cache hit (defeats the
+        # cache-eval intent).
+        assert (
+            self.dummy_warmup_query_text != self.real_question_segment_text
+        ), (
+            "dummy_warmup_query_text must differ from real_question_segment_text "
+            "so the real-question segment is a cache MISS"
+        )
 
     def chunk_by_id(self, cid: str) -> SelectedChunk:
         for c in self.selected_chunks:
@@ -86,6 +104,13 @@ DEFAULT_PREFIX = (
 DEFAULT_QUESTION_TEMPLATE = "Question: {question}\n\nAnswer:"
 
 DEFAULT_CHUNK_TEMPLATE = "Title: {title}\n\n{paragraph_text}"
+
+# The first prompt is a *warmup-only* prompt — it populates the
+# per-chunk KV cache but is not used for F1. The trailing segment must
+# differ from the real MuSiQue question so the real question segment
+# of the second prompt is NOT a cache hit. This sentinel-style query
+# does that and tells the model not to answer.
+DEFAULT_DUMMY_WARMUP_QUERY = "This is a cache warmup query. Do not answer."
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +273,7 @@ def build_case(
     prefix_text: str = DEFAULT_PREFIX,
     blend_special_str: str = "# #",
     question_template: str = DEFAULT_QUESTION_TEMPLATE,
+    dummy_warmup_query: str = DEFAULT_DUMMY_WARMUP_QUERY,
     num_chunks: int = 6,
     seed: int = 42,
     embedder=None,
@@ -279,7 +305,15 @@ def build_case(
     first_order = [c.chunk_id for c in permuted]
     second_order = list(reversed(first_order))
 
-    question_segment_text = question_template.format(question=example["question"].strip())
+    real_question_segment_text = question_template.format(
+        question=example["question"].strip(),
+    )
+
+    if dummy_warmup_query == real_question_segment_text:
+        # Extremely defensive: a user could pass --dummy-warmup-query that
+        # collides with this example's real question template. Skip the
+        # example rather than corrupting the cache-hit semantics.
+        return None
 
     return MusiqueCase(
         id=str(example["id"]),
@@ -289,7 +323,8 @@ def build_case(
         answer_aliases=list(example.get("answer_aliases") or []),
         prefix_text=prefix_text,
         blend_special_str=blend_special_str,
-        question_segment_text=question_segment_text,
+        real_question_segment_text=real_question_segment_text,
+        dummy_warmup_query_text=dummy_warmup_query,
         selected_chunks=chunks,
         first_order=first_order,
         second_order=second_order,

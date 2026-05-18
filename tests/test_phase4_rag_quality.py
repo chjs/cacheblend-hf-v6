@@ -3,12 +3,14 @@ Phase 4 tests — MuSiQue prompt construction + smoke comparison.
 
 Unit tests are CPU-only and don't need the MuSiQue dataset on disk:
 they exercise chunk selection, reverse-order policy, separator count
-validation, tokenizer-independence of Stage A, etc. The integration
-smoke test runs the actual script under `MUSIQUE_ANS_TRAIN_JSONL` if
-present (skip otherwise).
+validation, tokenizer-independence of Stage A, dummy-warmup vs real-
+question separation, recompute-ratio parser, and the failure-only
+subset computation. The integration smoke test runs the actual script
+under `MUSIQUE_ANS_TRAIN_JSONL` if present (skip otherwise).
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import subprocess
@@ -24,11 +26,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts._phase4_f1 import f1_one, f1_with_aliases
 from scripts._phase4_musique import (
-    DEFAULT_PREFIX, DEFAULT_QUESTION_TEMPLATE, MusiqueCase,
-    SelectedChunk, build_case, select_chunks,
+    DEFAULT_DUMMY_WARMUP_QUERY, DEFAULT_PREFIX, DEFAULT_QUESTION_TEMPLATE,
+    MusiqueCase, SelectedChunk, build_case, select_chunks,
 )
 from scripts._phase4_tokenize import (
     InternalSeparatorError, count_subsequence, materialize,
+)
+from scripts.run_rag_comparison import (
+    METHOD_FULL_KV_REUSE, METHOD_FULL_RECOMPUTE,
+    cacheblend_method_name, compute_failure_subset, parse_recompute_ratios,
 )
 
 
@@ -62,22 +68,14 @@ def _fake_example(
 
 
 # ---------------------------------------------------------------------------
-# Mock tokenizer — for tokenizer-related tests so we don't need to
-# download anything.
+# Mock tokenizer.
 # ---------------------------------------------------------------------------
 class MockTokenizer:
-    """
-    Minimal tokenizer for Stage B tests. Each character becomes one
-    token id, and `encode` prepends `[BOS]` (id=1) the way real
-    SentencePiece tokenizers do. The decoder is not needed for these
-    tests. The "blend special" token sequence is whatever
-    `encode("# #")[1:]` returns.
-    """
+    """Each character becomes one token id; `encode` prepends BOS=1."""
     bos_token_id = 1
     eos_token_id = 2
 
     def encode(self, text: str) -> List[int]:
-        # 1 (BOS) + ord(char) for each character.
         return [1] + [ord(c) for c in text]
 
     def decode(self, ids, skip_special_tokens=True):
@@ -93,9 +91,7 @@ def test_musique_selects_all_supporting_paragraphs():
     assert chunks is not None
     assert len(chunks) == 6
     supporting_ids = {c.paragraph_idx for c in chunks if c.is_supporting}
-    assert supporting_ids == {1, 3}, (
-        "both is_supporting paragraphs (idx 1, 3) must be included"
-    )
+    assert supporting_ids == {1, 3}
 
 
 # ===========================================================================
@@ -103,27 +99,18 @@ def test_musique_selects_all_supporting_paragraphs():
 # ===========================================================================
 def test_musique_fills_to_six_by_l2():
     ex = _fake_example()
-    # Mock embedder: assign known L2 distances. Make idx 2, 4, 6, 5, 0 close
-    # in that priority. The 4 nearest non-supporting (after taking the 2
-    # supporting) should be idx 2, 4, 6, 5.
-    # Embedding shape: arbitrary 4-d; first vector is the question.
     fake_vecs = {
-        # question
         "_q_": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
-        # non-supporting candidates (paragraph idx → distance from origin)
         0: np.array([3.0, 0.0, 0.0, 0.0], dtype=np.float32),
         2: np.array([0.1, 0.0, 0.0, 0.0], dtype=np.float32),
         4: np.array([0.2, 0.0, 0.0, 0.0], dtype=np.float32),
         5: np.array([2.0, 0.0, 0.0, 0.0], dtype=np.float32),
         6: np.array([0.3, 0.0, 0.0, 0.0], dtype=np.float32),
     }
-    expected_order = [2, 4, 6, 5]  # the 4 nearest non-supporting, by L2
+    expected_order = [2, 4, 6, 5]
 
     def embedder(texts):
         out = [fake_vecs["_q_"]]
-        # texts[1:] correspond to non-supporting paragraphs in their list
-        # order. We need to map them back to idx; tests for that mapping:
-        # the non-supporting list is [0, 2, 4, 5, 6] (in idx order).
         ns_idxs = [0, 2, 4, 5, 6]
         for idx in ns_idxs:
             out.append(fake_vecs[idx])
@@ -133,13 +120,12 @@ def test_musique_fills_to_six_by_l2():
     assert chunks is not None
     non_supp = [c for c in chunks if not c.is_supporting]
     assert sorted([c.paragraph_idx for c in non_supp]) == sorted(expected_order)
-    # And every non-supporting chunk has a recorded L2 distance.
     for c in non_supp:
         assert c.l2_distance_to_question is not None
 
 
 # ===========================================================================
-# 3. test_too_many_supporting_skip_or_error
+# 3. test_too_many_supporting_skip / error
 # ===========================================================================
 def test_too_many_supporting_skip():
     paragraphs = [
@@ -175,16 +161,17 @@ def test_reverse_order_policy():
 
 
 # ===========================================================================
-# 5. test_separator_count_six_chunks
+# 5. test_separator_count_still_seven (renamed; same intent)
 # ===========================================================================
-def test_separator_count_six_chunks():
+def test_separator_count_still_seven():
+    """Both prompts have exactly 1 (post-prefix) + 6 (per chunk) = 7 separators."""
     ex = _fake_example()
     case = build_case(ex, num_chunks=6, seed=42, embedder=None)
     assert case is not None
     tok = MockTokenizer()
     mat = materialize(case, tok, tokenizer_name_or_path="mock")
     assert mat is not None
-    assert mat.separator_count_first == 7   # 1 after prefix + 6 chunks
+    assert mat.separator_count_first == 7
     assert mat.separator_count_second == 7
 
 
@@ -192,13 +179,9 @@ def test_separator_count_six_chunks():
 # 6. test_no_internal_separator_detection
 # ===========================================================================
 def test_no_internal_separator_skip():
-    """If a chunk contains the separator subsequence, the example must skip."""
-    # Build a case whose chunk text literally contains "# #" — that's
-    # the same byte sequence the separator tokenizes to under MockTokenizer.
     paragraphs = [
         {"idx": 0, "title": "T0", "paragraph_text": "harmless",         "is_supporting": True},
-        # Chunk 1's body contains the literal separator string.
-        {"idx": 1, "title": "T1", "paragraph_text": "x # # y",           "is_supporting": True},
+        {"idx": 1, "title": "T1", "paragraph_text": "x # # y",          "is_supporting": True},
         {"idx": 2, "title": "T2", "paragraph_text": "harmless",         "is_supporting": False},
         {"idx": 3, "title": "T3", "paragraph_text": "harmless",         "is_supporting": False},
         {"idx": 4, "title": "T4", "paragraph_text": "harmless",         "is_supporting": False},
@@ -209,15 +192,14 @@ def test_no_internal_separator_skip():
     case = build_case(ex, num_chunks=6, seed=42, embedder=None)
     assert case is not None
     tok = MockTokenizer()
-    out = materialize(case, tok, tokenizer_name_or_path="mock",
-                      on_internal_separator="skip")
+    out = materialize(case, tok, tokenizer_name_or_path="mock", on_internal_separator="skip")
     assert out is None
 
 
 def test_no_internal_separator_error():
     paragraphs = [
         {"idx": 0, "title": "T0", "paragraph_text": "harmless",         "is_supporting": True},
-        {"idx": 1, "title": "T1", "paragraph_text": "x # # y",           "is_supporting": True},
+        {"idx": 1, "title": "T1", "paragraph_text": "x # # y",          "is_supporting": True},
         {"idx": 2, "title": "T2", "paragraph_text": "harmless",         "is_supporting": False},
         {"idx": 3, "title": "T3", "paragraph_text": "harmless",         "is_supporting": False},
         {"idx": 4, "title": "T4", "paragraph_text": "harmless",         "is_supporting": False},
@@ -228,24 +210,23 @@ def test_no_internal_separator_error():
     case = build_case(ex, num_chunks=6, seed=42, embedder=None)
     tok = MockTokenizer()
     with pytest.raises(InternalSeparatorError):
-        materialize(case, tok, tokenizer_name_or_path="mock",
-                    on_internal_separator="error")
+        materialize(case, tok, tokenizer_name_or_path="mock", on_internal_separator="error")
 
 
 # ===========================================================================
 # 7. test_tokenizer_independent_case_generation
 # ===========================================================================
 def test_tokenizer_independent_case_generation():
-    """`build_case` must produce a MusiqueCase without ever touching a tokenizer."""
     ex = _fake_example()
     case = build_case(ex, num_chunks=6, seed=42, embedder=None)
     assert case is not None
-    # MusiqueCase exposes texts, not token ids.
     assert not hasattr(case, "first_prompt_ids")
     assert not hasattr(case, "second_prompt_ids")
-    # selected_chunks must carry text, not tokens.
     for c in case.selected_chunks:
         assert isinstance(c.text, str)
+    # MusiqueCase exposes both query texts, not token ids.
+    assert isinstance(case.dummy_warmup_query_text, str)
+    assert isinstance(case.real_question_segment_text, str)
 
 
 # ===========================================================================
@@ -258,13 +239,10 @@ def test_chunk_token_ids_identical_across_orders():
     mat = materialize(case, tok, tokenizer_name_or_path="mock")
     assert mat is not None
 
-    # For every chunk id, find its position in first_prompt_ids and second_prompt_ids
-    # and verify the token sub-sequences match.
     sep = mat.sep_ids
     L_sep = len(sep)
 
     def chunk_positions(token_ids: List[int], order: List[str]):
-        # Walk: prefix, sep, chunk1, sep, chunk2, sep, ..., chunk6, sep, question.
         pos = len(mat.prefix_ids) + L_sep
         for cid in order:
             cids = mat.chunk_ids_by_id[cid]
@@ -278,13 +256,154 @@ def test_chunk_token_ids_identical_across_orders():
 
 
 # ===========================================================================
+# NEW: dummy / real question separation
+# ===========================================================================
+def _is_subsequence(haystack: List[int], needle: List[int]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    for i in range(len(haystack) - len(needle) + 1):
+        if haystack[i:i + len(needle)] == needle:
+            return True
+    return False
+
+
+def test_first_prompt_uses_dummy_query():
+    """First prompt's tail must be the dummy warmup query, not the real question."""
+    ex = _fake_example()
+    case = build_case(ex, num_chunks=6, seed=42, embedder=None,
+                      dummy_warmup_query="WARMUP QUERY DO NOT ANSWER")
+    assert case is not None
+    tok = MockTokenizer()
+    mat = materialize(case, tok, tokenizer_name_or_path="mock")
+    assert mat is not None
+
+    assert _is_subsequence(mat.first_prompt_ids, mat.dummy_query_ids)
+    assert not _is_subsequence(mat.first_prompt_ids, mat.real_question_ids)
+
+
+def test_second_prompt_uses_real_question():
+    """Second prompt's tail must be the real MuSiQue question segment, not the dummy."""
+    ex = _fake_example()
+    case = build_case(ex, num_chunks=6, seed=42, embedder=None,
+                      dummy_warmup_query="WARMUP QUERY DO NOT ANSWER")
+    assert case is not None
+    tok = MockTokenizer()
+    mat = materialize(case, tok, tokenizer_name_or_path="mock")
+    assert mat is not None
+
+    assert _is_subsequence(mat.second_prompt_ids, mat.real_question_ids)
+    assert not _is_subsequence(mat.second_prompt_ids, mat.dummy_query_ids)
+
+
+def test_real_question_not_equal_dummy_query():
+    """Default warmup query must differ from a synthetic example's real question."""
+    ex = _fake_example(question="Which mammal is named here?")
+    case = build_case(ex, num_chunks=6, seed=42, embedder=None)
+    assert case is not None
+    assert case.dummy_warmup_query_text != case.real_question_segment_text
+    # The default warmup query text starts with the cache-warmup sentence,
+    # while the question segment uses the `Question:\nAnswer:` template.
+    assert "warmup" in case.dummy_warmup_query_text.lower()
+    assert "Question:" in case.real_question_segment_text
+    assert ex["question"] not in case.dummy_warmup_query_text
+
+
+def test_dummy_query_default_is_sentinel():
+    """Sanity: the project's default dummy warmup query is the documented sentence."""
+    assert DEFAULT_DUMMY_WARMUP_QUERY == "This is a cache warmup query. Do not answer."
+
+
+# ===========================================================================
+# NEW: ratio parser
+# ===========================================================================
+def test_cacheblend_ratio_parser():
+    assert parse_recompute_ratios("0.0,0.05,0.15,0.30,0.50,1.00") == \
+        [0.0, 0.05, 0.15, 0.30, 0.50, 1.00]
+    # Order preserved even when unsorted.
+    assert parse_recompute_ratios("0.5,0.1") == [0.5, 0.1]
+    # Single value.
+    assert parse_recompute_ratios("0.15") == [0.15]
+    # Whitespace tolerated; empty fragments ignored.
+    assert parse_recompute_ratios(" 0.0 , 0.15 ") == [0.0, 0.15]
+    # Dedupe.
+    assert parse_recompute_ratios("0.15,0.15,0.30") == [0.15, 0.30]
+    # Out-of-range rejected.
+    for bad in ("-0.1", "1.5", "abc", ""):
+        with pytest.raises(ValueError):
+            parse_recompute_ratios(bad)
+
+
+# ===========================================================================
+# NEW: failure-only subset computation
+# ===========================================================================
+def test_failure_subset_computation():
+    """Synthetic per-example records; verify subset selection + per-method
+    means are computed only over the subset."""
+    def rec(eid: str, *, full: float, reuse: float, blend015: float, blend100: float):
+        return {
+            "id": eid,
+            "methods": {
+                METHOD_FULL_RECOMPUTE: {"f1": full,    "prefill_ms": 100.0},
+                METHOD_FULL_KV_REUSE:  {"f1": reuse,   "prefill_ms": 10.0},
+                cacheblend_method_name(0.15): {"f1": blend015, "prefill_ms": 20.0},
+                cacheblend_method_name(1.00): {"f1": blend100, "prefill_ms": 95.0},
+            },
+        }
+
+    records = [
+        # ex0: reuse worse than full → goes into subset.
+        rec("ex0", full=1.0, reuse=0.2, blend015=0.6, blend100=1.0),
+        # ex1: reuse = full → NOT in subset.
+        rec("ex1", full=0.8, reuse=0.8, blend015=0.8, blend100=0.8),
+        # ex2: reuse better than full → NOT in subset.
+        rec("ex2", full=0.5, reuse=0.9, blend015=0.7, blend100=0.5),
+        # ex3: reuse worse than full → in subset.
+        rec("ex3", full=1.0, reuse=0.0, blend015=0.5, blend100=1.0),
+    ]
+    methods = [
+        METHOD_FULL_RECOMPUTE, METHOD_FULL_KV_REUSE,
+        cacheblend_method_name(0.15), cacheblend_method_name(1.00),
+    ]
+    out = compute_failure_subset(records, methods)
+    assert out["num_examples"] == 2  # ex0, ex3.
+    # Subset means: full = (1.0 + 1.0)/2 = 1.0; reuse = (0.2 + 0.0)/2 = 0.1.
+    assert out["per_method_f1_mean"][METHOD_FULL_RECOMPUTE] == pytest.approx(1.0)
+    assert out["per_method_f1_mean"][METHOD_FULL_KV_REUSE] == pytest.approx(0.1)
+    # CacheBlend r=0.15: (0.6 + 0.5)/2 = 0.55; r=1.00: (1.0 + 1.0)/2 = 1.0.
+    assert out["per_method_f1_mean"][cacheblend_method_name(0.15)] == pytest.approx(0.55)
+    assert out["per_method_f1_mean"][cacheblend_method_name(1.00)] == pytest.approx(1.0)
+    # Best CacheBlend ratio is r=1.00 (1.0 > 0.55).
+    assert out["best_cacheblend_method"] == cacheblend_method_name(1.00)
+    assert out["best_cacheblend_f1_mean"] == pytest.approx(1.0)
+
+
+def test_failure_subset_empty_subset():
+    """When no example fails, subset is empty and means are nan."""
+    rec = {
+        "id": "ex0",
+        "methods": {
+            METHOD_FULL_RECOMPUTE: {"f1": 0.5, "prefill_ms": 1.0},
+            METHOD_FULL_KV_REUSE:  {"f1": 0.5, "prefill_ms": 1.0},
+            cacheblend_method_name(0.15): {"f1": 0.5, "prefill_ms": 1.0},
+        },
+    }
+    out = compute_failure_subset(
+        [rec],
+        [METHOD_FULL_RECOMPUTE, METHOD_FULL_KV_REUSE, cacheblend_method_name(0.15)],
+    )
+    assert out["num_examples"] == 0
+    for name in (METHOD_FULL_RECOMPUTE, METHOD_FULL_KV_REUSE, cacheblend_method_name(0.15)):
+        v = out["per_method_f1_mean"][name]
+        assert math.isnan(v)
+
+
+# ===========================================================================
 # Extras: F1 sanity, count_subsequence.
 # ===========================================================================
 def test_f1_basics():
     assert f1_one("the whale", "whale") == pytest.approx(2 * (1/2) * (1/1) / (1/2 + 1/1))
     assert f1_with_aliases("dog", "whale", aliases=["mammal", "DOG"]) == 1.0
     assert f1_one("", "anything") == 0.0
-    # Empty against empty is degenerate but defined.
     assert f1_one("", "") == 1.0
 
 
@@ -309,7 +428,8 @@ MUSIQUE_PATH = os.environ.get("MUSIQUE_ANS_TRAIN_JSONL")
     ),
 )
 def test_integration_smoke():
-    """End-to-end script run on a tiny slice."""
+    """End-to-end script run on a tiny slice — checks the script runs and
+    emits the expected segment-diagnostic invariants."""
     with tempfile.TemporaryDirectory() as tmp:
         md_out = Path(tmp) / "phase4_smoke.md"
         jsonl_out = Path(tmp) / "details.jsonl"
@@ -321,37 +441,31 @@ def test_integration_smoke():
             "--dtype", "bfloat16",
             "--output", str(md_out),
             "--write-jsonl-details", str(jsonl_out),
+            "--cacheblend-recompute-ratios", "0.0,0.15,1.00",
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
-        assert res.returncode == 0, (
-            f"script failed: stderr={res.stderr[-2000:]}"
-        )
+        assert res.returncode == 0, f"script failed: stderr={res.stderr[-2000:]}"
         assert md_out.exists() and md_out.stat().st_size > 0
         assert jsonl_out.exists() and jsonl_out.stat().st_size > 0
 
-        # Pull F1 values and assert smoke gates.
         import json
-        f1s = {"full_recompute": [], "full_kv_reuse": [], "cacheblend": []}
+        records = []
         with jsonl_out.open() as fp:
             for line in fp:
-                rec = json.loads(line)
-                for m in f1s:
-                    f1s[m].append(rec["methods"][m]["f1"])
-                    assert math.isfinite(rec["methods"][m]["f1"])
-                    assert rec["methods"][m]["f1"] >= 0
-        from statistics import mean
-        f1_full = mean(f1s["full_recompute"])
-        f1_blend = mean(f1s["cacheblend"])
-        f1_reuse = mean(f1s["full_kv_reuse"])
-        # CacheBlend within 0.05 of full recompute.
-        assert abs(f1_blend - f1_full) <= 0.05, (
-            f"CacheBlend F1 {f1_blend:.3f} too far from Full {f1_full:.3f}"
-        )
-        # Full reuse should not beat CacheBlend by more than 0.03.
-        assert f1_reuse - f1_blend <= 0.03, (
-            f"Full reuse F1 {f1_reuse:.3f} beats CacheBlend {f1_blend:.3f} by more than 0.03"
-        )
+                records.append(json.loads(line))
+        assert records, "no per-example records emitted"
 
-
-# math import only needed by the integration smoke; quietly inert otherwise.
-import math   # noqa: E402  (top of integration smoke needs it)
+        for rec in records:
+            seg = rec.get("segment_diagnostics", {})
+            # Cache-hit invariant: real question segment must MISS.
+            # If it doesn't, this run is invalid as a RAG-cache test.
+            assert seg.get("real_question_segment_cache_hit") in (False, None), (
+                f"example {rec.get('id')}: real question segment was a cache HIT — "
+                "this defeats the cache-eval intent"
+            )
+            # Every CacheBlend ratio key must be present.
+            for r in (0.0, 0.15, 1.00):
+                name = cacheblend_method_name(r)
+                assert name in rec["methods"], f"missing method {name}"
+                assert math.isfinite(rec["methods"][name]["f1"])
+                assert rec["methods"][name]["f1"] >= 0

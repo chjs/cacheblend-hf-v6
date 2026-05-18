@@ -1,17 +1,17 @@
 """
 Phase 4 — MuSiQue RAG quality comparison for CacheBlend-HF.
 
-Compares three prefill methods on MuSiQue Answerable:
+Compares prefill methods on MuSiQue Answerable:
   1. Full KV recompute (stock HF prefill on the second prompt).
   2. Full KV reuse (Prompt Cache baseline: cached chunk KVs + RoPE
      shift, no recomputation).
-  3. CacheBlend (Phase 3 LMCBlender, check_layers=[1], recomp_ratios=[0.15]).
+  3. CacheBlend at a sweep of recompute ratios.
 
-For each evaluated example the script:
-  - generates an answer greedily (do_sample=False)
-  - scores token-level F1 against the gold answer + aliases
-  - measures prefill latency
-and writes an aggregate markdown + optional per-example JSONL.
+The first prompt is a *warmup-only* prompt ending in a dummy query;
+its sole purpose is to populate per-chunk KV under the chunks' hashes.
+The second prompt ends in the *real* MuSiQue question and is the only
+prompt evaluated for F1. The real question segment must therefore be
+a cache MISS — segment-level diagnostics are written for every example.
 
 See docs/phases/PHASE4_PROMPT.md for the full spec.
 """
@@ -35,7 +35,8 @@ import torch  # noqa: E402
 
 from scripts._phase4_f1 import f1_with_aliases  # noqa: E402
 from scripts._phase4_musique import (             # noqa: E402
-    DEFAULT_PREFIX, DEFAULT_QUESTION_TEMPLATE, MusiqueCase, iter_cases,
+    DEFAULT_DUMMY_WARMUP_QUERY, DEFAULT_PREFIX, DEFAULT_QUESTION_TEMPLATE,
+    iter_cases,
 )
 from scripts._phase4_runtime import (             # noqa: E402
     connector_to_dyncache, decode_from_full_cache, full_recompute_run,
@@ -44,6 +45,52 @@ from scripts._phase4_runtime import (             # noqa: E402
 from scripts._phase4_tokenize import (            # noqa: E402
     InternalSeparatorError, MaterializedCase, materialize,
 )
+
+
+# ---------------------------------------------------------------------------
+# Method-name helpers (single source of truth for the order in tables).
+# ---------------------------------------------------------------------------
+METHOD_FULL_RECOMPUTE = "full_recompute"
+METHOD_FULL_KV_REUSE = "full_kv_reuse"
+
+
+def cacheblend_method_name(ratio: float) -> str:
+    """`CacheBlend r=0.15` style for the markdown table; `cacheblend_r0.15`
+    for JSON-friendly keys. Use the same convention everywhere."""
+    return f"cacheblend_r{ratio:.2f}"
+
+
+def cacheblend_display_name(ratio: float) -> str:
+    return f"CacheBlend r={ratio:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Ratio parser (unit-testable).
+# ---------------------------------------------------------------------------
+def parse_recompute_ratios(spec: str) -> List[float]:
+    """Parse `--cacheblend-recompute-ratios` from a comma-separated string.
+
+    Preserves order, deduplicates while preserving first occurrence,
+    raises ValueError on values outside [0, 1] or non-floats.
+    """
+    out: List[float] = []
+    seen: set = set()
+    for raw in spec.split(","):
+        s = raw.strip()
+        if not s:
+            continue
+        v = float(s)
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"recompute ratio out of [0,1]: {v}")
+        # Round to 4 dp for dedupe but preserve the parsed value in output.
+        key = round(v, 4)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    if not out:
+        raise ValueError("no valid recompute ratios parsed from spec")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +124,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefix-file", default=None,
                    help="Read prefix text from this file (takes precedence over --prefix).")
     p.add_argument("--question-template", default=DEFAULT_QUESTION_TEMPLATE)
+    p.add_argument("--dummy-warmup-query", default=DEFAULT_DUMMY_WARMUP_QUERY,
+                   help="Trailing segment of the FIRST (warmup-only) prompt. "
+                        "Must differ from the real MuSiQue question.")
     p.add_argument("--on-too-many-supporting", choices=["skip", "error"], default="skip")
     p.add_argument("--on-internal-separator", choices=["skip", "error"], default="skip")
     p.add_argument("--max-model-len", type=int, default=None,
@@ -85,7 +135,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--write-jsonl-details", default=None,
                    help="Optional path for per-example JSONL details.")
     p.add_argument("--cacheblend-check-layers", type=int, default=1)
-    p.add_argument("--cacheblend-recomp-ratio", type=float, default=0.15)
+    p.add_argument("--cacheblend-recompute-ratios", default="0.15",
+                   help="Comma-separated list of CacheBlend recompute ratios. "
+                        "Default keeps Phase 4 baseline (`0.15`). Pass "
+                        "`0.0,0.05,0.15,0.30,0.50,1.00` for the rerun sweep.")
 
     return p.parse_args()
 
@@ -185,12 +238,86 @@ def _build_cacheblend_pipeline(
     )
 
     blender_cls = LMCFullReuseBlender if use_full_reuse else LMCBlender
-    # Build directly (skip the LMCBlenderBuilder cache so two different
-    # blender classes can both be built within one run).
     blender = blender_cls(
         cache_engine=engine, gpu_connector=connector, hf_model=model, config=cfg,
     )
     return engine, connector, blender
+
+
+# ---------------------------------------------------------------------------
+# Segment cache-hit diagnostic.
+# ---------------------------------------------------------------------------
+def _diagnose_segment_hits(
+    engine,
+    *,
+    second_prompt_ids: torch.Tensor,
+    materialized: MaterializedCase,
+) -> Dict[str, Any]:
+    """
+    Walk the SegmentTokenDatabase over the SECOND prompt and for each
+    segment check whether layer-0's key is present in the backend.
+
+    The expected pattern after warmup with the first prompt:
+      prefix              → HIT (same prefix in both prompts)
+      chunk_<each>        → HIT (same per-chunk token ids in both prompts)
+      real_question       → MISS (the first prompt's tail was the dummy
+                            warmup query, which hashes differently)
+    """
+    token_db = engine.token_database
+    num_layers = engine.num_layers
+
+    # The token_database's process_tokens splits on `sep_ids` and yields
+    # one (start, end, key) per segment in order. The materialized case
+    # tells us how to name each segment.
+    second_ids_cpu = second_prompt_ids.detach().to(device="cpu", dtype=torch.long)
+    segment_names: List[str] = ["prefix"] + [
+        f"chunk:{cid}" for cid in materialized.case.second_order
+    ] + ["real_question"]
+
+    per_segment_hit: Dict[str, bool] = {}
+    per_segment_len: Dict[str, int] = {}
+    retrieved_tokens = 0
+
+    seg_iter = list(token_db.process_tokens(tokens=second_ids_cpu))
+    if len(seg_iter) != len(segment_names):
+        # If the segment count doesn't match what we expect, report as
+        # an unknown layout rather than silently mislabel hits.
+        return {
+            "segments": [],
+            "segment_token_lengths": {},
+            "segment_cache_hit": {},
+            "expected_segment_count": len(segment_names),
+            "actual_segment_count": len(seg_iter),
+            "retrieved_token_count": 0,
+            "real_question_segment_cache_hit": None,
+            "all_six_chunks_cache_hit": False,
+            "prefix_cache_hit": None,
+            "layout_mismatch": True,
+        }
+
+    for name, (start, end, key) in zip(segment_names, seg_iter):
+        layer_keys = key.split_layers(num_layers)
+        hit = engine.storage.contains(layer_keys[0])
+        per_segment_hit[name] = bool(hit)
+        per_segment_len[name] = int(end - start)
+        if hit:
+            retrieved_tokens += int(end - start)
+
+    chunk_segment_names = [f"chunk:{cid}" for cid in materialized.case.second_order]
+    all_chunks_hit = all(per_segment_hit.get(n, False) for n in chunk_segment_names)
+
+    return {
+        "segments": segment_names,
+        "segment_token_lengths": per_segment_len,
+        "segment_cache_hit": per_segment_hit,
+        "retrieved_token_count": retrieved_tokens,
+        "real_question_segment_cache_hit": per_segment_hit.get("real_question"),
+        "all_six_chunks_cache_hit": all_chunks_hit,
+        "prefix_cache_hit": per_segment_hit.get("prefix"),
+        "expected_segment_count": len(segment_names),
+        "actual_segment_count": len(seg_iter),
+        "layout_mismatch": False,
+    }
 
 
 @torch.no_grad()
@@ -205,18 +332,18 @@ def _run_cache_method(
     max_new_tokens: int,
     stock_kv_first_prompt: List[Tuple[torch.Tensor, torch.Tensor]],
     instance_id: str,
-) -> Tuple[str, float, List[int]]:
+    return_segment_diagnostics: bool = False,
+) -> Tuple[str, float, List[int], Optional[Dict[str, Any]]]:
     """
-    Run either Method 2 (Full reuse) or Method 3 (CacheBlend) on the
-    second prompt. Returns `(generated_text, prefill_ms, generated_ids)`.
+    Run either Method 2 (Full reuse) or one ratio of Method 3 (CacheBlend)
+    on the second prompt. Returns
+        (generated_text, prefill_ms, generated_ids, segment_diagnostics_or_None).
 
     Assumes `model` is UNPATCHED at entry; this function patches it
     (via building the blender pipeline) and unpatches before decode.
     """
     device = next(model.parameters()).device
 
-    # Build the pipeline (this patches the model in place via
-    # LMCBaseModel.__init__).
     engine, connector, blender = _build_cacheblend_pipeline(
         model,
         use_full_reuse=use_full_reuse,
@@ -232,18 +359,20 @@ def _run_cache_method(
         materialized.second_prompt_ids, dtype=torch.long, device=device,
     )
 
-    # ----- Warmup (no F1 measured) -----
-    # `stock_kv_first_prompt` was captured by a stock HF prefill on the
-    # FIRST prompt (`_per_example._stock_prefill(model, first_ids)`).
-    # We stash those per-chunk KVs into the LocalCPUBackend, keyed by
-    # each chunk's hash. The first prompt is never generated from.
+    # ----- Warmup (no F1 measured): populate the cache from the FIRST
+    # (warmup-only) prompt. -----
     engine.store_from_prefill(first_prompt_ids, stock_kv_first_prompt)
 
+    # ----- Segment cache-hit diagnostic (post-warmup, pre-blend) -----
+    seg_diag: Optional[Dict[str, Any]] = None
+    if return_segment_diagnostics:
+        seg_diag = _diagnose_segment_hits(
+            engine,
+            second_prompt_ids=second_prompt_ids,
+            materialized=materialized,
+        )
+
     # ----- Evaluation prefill on the SECOND prompt -----
-    # `blender.blend(...)` runs the layerwise prefill on the second
-    # prompt, reusing the cached chunk KVs (RoPE-shifted into the
-    # second prompt's chunk positions). The resulting fused KV is
-    # fed to the decoder to generate the answer that gets F1-scored.
     cuda = device.type == "cuda"
     if cuda:
         torch.cuda.synchronize()
@@ -266,27 +395,23 @@ def _run_cache_method(
         device=device,
     )
 
-    # Important: model must be UNPATCHED for the manual decode loop to
-    # work (the patched o_proj / RMSNorm wrappers break stock forward).
     unpatch_hf_model(model)
 
     text, gen_ids = decode_from_full_cache(
         model, tokenizer, second_prompt_ids, fused_cache, max_new_tokens,
     )
 
-    # Release the connector's GPU buffers and the fused cache before
-    # the next example.
     connector.reset()
     del connector, engine, blender, fused_cache
     gc.collect()
     if cuda:
         torch.cuda.empty_cache()
 
-    return text, prefill_ms, gen_ids
+    return text, prefill_ms, gen_ids, seg_diag
 
 
 # ---------------------------------------------------------------------------
-# Per-example driver (all three methods + bookkeeping).
+# Per-example driver (all methods + bookkeeping).
 # ---------------------------------------------------------------------------
 def _stock_prefill(model, prompt_ids: torch.Tensor):
     """Run stock forward and return per-layer (K, V) tensors for warmup."""
@@ -308,6 +433,17 @@ def _stock_prefill(model, prompt_ids: torch.Tensor):
     return layers
 
 
+def _first_diff_index(a: List[int], b: List[int]) -> Optional[int]:
+    """Return the first index where two token-id lists differ, or None."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    if len(a) != len(b):
+        return n
+    return None
+
+
 def _per_example(
     model,
     tokenizer,
@@ -315,25 +451,19 @@ def _per_example(
     *,
     max_new_tokens: int,
     cacheblend_check_layers: List[int],
-    cacheblend_recomp_ratios: List[float],
+    cacheblend_recompute_ratios: List[float],
 ) -> Dict[str, Any]:
     """
-    Run all three methods on **the second prompt** of one example.
+    Run all methods on **the second prompt** of one example.
 
-    Role split (made explicit by user request):
-      - `first_prompt_ids`  → **warmup only**. Stock HF prefill on this
-        prompt populates `LMCacheEngine` with per-chunk KV under the
-        chunks' hashes. No F1 is computed on this prompt.
-      - `second_prompt_ids` → **evaluation only**. All three methods
-        (Full recompute / Full KV reuse / CacheBlend) generate from
-        this prompt; F1 vs gold answer is computed on those generations.
-
-    The two prompts share prefix / separator / per-chunk token sequence /
-    question. The only thing that differs is chunk order:
-    `second_order = reversed(first_order)`. So cached chunk KVs from the
-    first prompt are reused at *different positions* in the second
-    prompt (the GPU connector applies `FusedRope` to shift K). The
-    quality of that position-shifted reuse is what F1 reflects.
+    Role split (unchanged):
+      - `first_prompt_ids`  → **warmup only**. Stock HF prefill populates
+        the cache with per-chunk KV. The first prompt's tail is a *dummy
+        warmup query*, not the real MuSiQue question. No F1 is measured.
+      - `second_prompt_ids` → **evaluation only**. All methods generate
+        from this prompt; F1 is computed on those generations. The
+        second prompt's tail is the *real* MuSiQue question segment;
+        this segment must be a cache MISS.
     """
     device = next(model.parameters()).device
     case = materialized.case
@@ -346,42 +476,73 @@ def _per_example(
     )
 
     # ---- Method 1 (evaluation): Full KV recompute on the second prompt. ----
-    # Model is unpatched. F1 reference value for this example.
     text1, prefill1, gen1 = full_recompute_run(model, tokenizer, second_ids, max_new_tokens)
     f1_full = f1_with_aliases(text1, case.answer, case.answer_aliases)
 
     # ---- Warmup (no F1 measured): stock prefill on the FIRST prompt. ----
-    # Captures per-layer K, V to seed the cache. Methods 2 and 3 reuse
-    # these chunk KVs (shifted to the second prompt's chunk positions
-    # via FusedRope inside the GPU connector). The first prompt is never
-    # generated from and never F1-scored.
     stock_kv_first = _stock_prefill(model, first_ids)
 
     # ---- Method 2 (evaluation): Full KV reuse on the second prompt. ----
-    # Uses warmup KV from the first prompt; skips HKVD recomputation.
-    text2, prefill2, gen2 = _run_cache_method(
+    text2, prefill2, gen2, seg_diag = _run_cache_method(
         model, tokenizer, materialized,
         use_full_reuse=True,
         check_layers=cacheblend_check_layers,
-        recomp_ratios=cacheblend_recomp_ratios,
+        recomp_ratios=[0.0],   # ignored by FullReuse but still required.
         max_new_tokens=max_new_tokens,
         stock_kv_first_prompt=stock_kv_first,
         instance_id="hf_cacheblend_phase4_full_reuse",
+        return_segment_diagnostics=True,
     )
     f1_reuse = f1_with_aliases(text2, case.answer, case.answer_aliases)
 
-    # ---- Method 3 (evaluation): CacheBlend on the second prompt. ----
-    # Uses the same warmup KV, plus HKVD recomputation of 15% tokens.
-    text3, prefill3, gen3 = _run_cache_method(
-        model, tokenizer, materialized,
-        use_full_reuse=False,
-        check_layers=cacheblend_check_layers,
-        recomp_ratios=cacheblend_recomp_ratios,
-        max_new_tokens=max_new_tokens,
-        stock_kv_first_prompt=stock_kv_first,
-        instance_id="hf_cacheblend_phase4_blend",
-    )
-    f1_blend = f1_with_aliases(text3, case.answer, case.answer_aliases)
+    # ---- Method 3 (evaluation): CacheBlend across all ratios. ----
+    cacheblend_results: Dict[str, Dict[str, Any]] = {}
+    for r in cacheblend_recompute_ratios:
+        text3, prefill3, gen3, _ = _run_cache_method(
+            model, tokenizer, materialized,
+            use_full_reuse=False,
+            check_layers=cacheblend_check_layers,
+            recomp_ratios=[r],
+            max_new_tokens=max_new_tokens,
+            stock_kv_first_prompt=stock_kv_first,
+            instance_id=f"hf_cacheblend_phase4_blend_r{int(r*10000):05d}",
+            return_segment_diagnostics=False,
+        )
+        f1_blend_r = f1_with_aliases(text3, case.answer, case.answer_aliases)
+        cacheblend_results[cacheblend_method_name(r)] = {
+            "ratio": float(r),
+            "generated_text": text3,
+            "generated_ids": gen3,
+            "f1": f1_blend_r,
+            "prefill_ms": prefill3,
+        }
+
+    methods: Dict[str, Any] = {
+        METHOD_FULL_RECOMPUTE: {
+            "generated_text": text1, "generated_ids": gen1,
+            "f1": f1_full, "prefill_ms": prefill1,
+        },
+        METHOD_FULL_KV_REUSE: {
+            "generated_text": text2, "generated_ids": gen2,
+            "f1": f1_reuse, "prefill_ms": prefill2,
+        },
+    }
+    methods.update(cacheblend_results)
+
+    # ---- Generated-token comparisons (for diagnostic interpretation) ----
+    comparisons: Dict[str, Any] = {}
+    if cacheblend_method_name(0.15) in cacheblend_results:
+        cb015 = cacheblend_results[cacheblend_method_name(0.15)]
+        comparisons["reuse_eq_blend_r0.15"] = (gen2 == cb015["generated_ids"])
+        comparisons["first_diff_token_reuse_vs_blend_r0.15"] = _first_diff_index(
+            gen2, cb015["generated_ids"],
+        )
+    if cacheblend_method_name(1.00) in cacheblend_results:
+        cb100 = cacheblend_results[cacheblend_method_name(1.00)]
+        comparisons["full_eq_blend_r1.00"] = (gen1 == cb100["generated_ids"])
+        comparisons["first_diff_token_full_vs_blend_r1.00"] = _first_diff_index(
+            gen1, cb100["generated_ids"],
+        )
 
     return {
         "id": case.id,
@@ -389,6 +550,8 @@ def _per_example(
         "question": case.question,
         "answer": case.answer,
         "answer_aliases": case.answer_aliases,
+        "dummy_warmup_query": case.dummy_warmup_query_text,
+        "real_question_segment": case.real_question_segment_text,
         "selected_chunks": [
             {
                 "chunk_id": c.chunk_id,
@@ -411,10 +574,12 @@ def _per_example(
             "second": case.second_order,
             "policy": case.order_policy,
         },
-        "tokenization": materialized.to_metadata_dict(),
-        "prompt_lengths": {
-            "first": len(materialized.first_prompt_ids),
-            "second": len(materialized.second_prompt_ids),
+        "tokenization": {
+            **materialized.to_metadata_dict(),
+            "separator_count_first": materialized.separator_count_first,
+            "separator_count_second": materialized.separator_count_second,
+            "first_prompt_token_length": len(materialized.first_prompt_ids),
+            "second_prompt_token_length": len(materialized.second_prompt_ids),
         },
         "validation": {
             "separator_count_first": materialized.separator_count_first,
@@ -422,17 +587,9 @@ def _per_example(
             "orders_are_reverse": materialized.orders_are_reverse,
             "no_internal_separator": materialized.no_internal_separator,
         },
-        "methods": {
-            "full_recompute": {
-                "generated_text": text1, "f1": f1_full, "prefill_ms": prefill1,
-            },
-            "full_kv_reuse": {
-                "generated_text": text2, "f1": f1_reuse, "prefill_ms": prefill2,
-            },
-            "cacheblend": {
-                "generated_text": text3, "f1": f1_blend, "prefill_ms": prefill3,
-            },
-        },
+        "segment_diagnostics": seg_diag or {},
+        "methods": methods,
+        "generated_comparisons": comparisons,
     }
 
 
@@ -445,6 +602,47 @@ def _agg(values: List[float]) -> Tuple[float, float]:
     return float(mean(values)), float(median(values))
 
 
+def compute_failure_subset(
+    per_example_records: List[Dict[str, Any]],
+    method_names: List[str],
+) -> Dict[str, Any]:
+    """
+    Examples where Full KV reuse F1 < Full recompute F1 — the subset
+    where naive reuse loses quality. Aggregate every method's F1 over
+    just that subset and report it.
+    """
+    subset_records: List[Dict[str, Any]] = []
+    for rec in per_example_records:
+        m = rec.get("methods", {})
+        if METHOD_FULL_RECOMPUTE not in m or METHOD_FULL_KV_REUSE not in m:
+            continue
+        if m[METHOD_FULL_KV_REUSE]["f1"] < m[METHOD_FULL_RECOMPUTE]["f1"]:
+            subset_records.append(rec)
+
+    per_method_means: Dict[str, float] = {}
+    for name in method_names:
+        vals = []
+        for rec in subset_records:
+            if name in rec.get("methods", {}):
+                vals.append(rec["methods"][name]["f1"])
+        per_method_means[name] = float(mean(vals)) if vals else float("nan")
+
+    # Best CacheBlend ratio on the subset (max F1 mean among r=... entries).
+    cb_means = {n: v for n, v in per_method_means.items() if n.startswith("cacheblend_r")}
+    if cb_means:
+        best_name = max(cb_means, key=lambda k: (cb_means[k] if math.isfinite(cb_means[k]) else -1.0))
+        best_f1 = cb_means[best_name]
+    else:
+        best_name, best_f1 = None, float("nan")
+
+    return {
+        "num_examples": len(subset_records),
+        "per_method_f1_mean": per_method_means,
+        "best_cacheblend_method": best_name,
+        "best_cacheblend_f1_mean": best_f1,
+    }
+
+
 def _write_markdown(
     output_path: str,
     *,
@@ -453,17 +651,24 @@ def _write_markdown(
     skipped: int,
     skip_counts: Dict[str, int],
     per_method: Dict[str, Dict[str, List[float]]],
+    method_names: List[str],
+    cacheblend_ratios: List[float],
+    seg_diag_summary: Dict[str, Any],
+    failure_subset: Dict[str, Any],
 ) -> None:
-    """Per the spec; numbers are pre-aggregated by caller."""
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    def _table_row(method_name: str, m: Dict[str, List[float]]) -> str:
+    def _table_row(method_display: str, m: Dict[str, List[float]]) -> str:
         f1m, f1p = _agg(m["f1"])
         lm, lp = _agg(m["prefill_ms"])
         return (
-            f"| {method_name} | {f1m:.4f} | {f1p:.4f} | "
+            f"| {method_display} | {f1m:.4f} | {f1p:.4f} | "
             f"{lm:.2f} | {lp:.2f} |"
         )
+
+    def _f1_mean(name: str) -> float:
+        vals = per_method.get(name, {}).get("f1", [])
+        return float(mean(vals)) if vals else float("nan")
 
     lines: List[str] = []
     lines.append("# Phase 4 — MuSiQue RAG comparison")
@@ -479,13 +684,136 @@ def _write_markdown(
     lines.append(f"embedding_model: `{args.embedding_model}`")
     lines.append(f"embedding_normalize: {args.embedding_normalize}")
     lines.append(f"max_new_tokens: {args.max_new_tokens}")
+    lines.append(f"dummy_warmup_query: `{args.dummy_warmup_query}`")
+    lines.append(f"cacheblend_recompute_ratios: `{','.join(f'{r:.2f}' for r in cacheblend_ratios)}`")
     lines.append("")
+
+    # ----- main aggregate -----
     lines.append("| Method | F1 mean | F1 p50 | Prefill ms mean | Prefill ms p50 |")
     lines.append("|--------|---------|--------|-----------------|----------------|")
-    lines.append(_table_row("Full recompute", per_method["full_recompute"]))
-    lines.append(_table_row("Full KV reuse",  per_method["full_kv_reuse"]))
-    lines.append(_table_row("CacheBlend",     per_method["cacheblend"]))
+    lines.append(_table_row("Full recompute", per_method[METHOD_FULL_RECOMPUTE]))
+    lines.append(_table_row("Full KV reuse",  per_method[METHOD_FULL_KV_REUSE]))
+    # Always include r=0.15 if requested; for the rest, defer to the ratio sweep section.
+    if cacheblend_method_name(0.15) in per_method:
+        lines.append(_table_row("CacheBlend r=0.15", per_method[cacheblend_method_name(0.15)]))
     lines.append("")
+
+    # ----- ratio sweep -----
+    if len(cacheblend_ratios) > 1:
+        lines.append("## CacheBlend ratio sweep")
+        lines.append("")
+        lines.append("| Ratio | F1 mean | F1 p50 | Prefill ms mean | Prefill ms p50 |")
+        lines.append("|-------|---------|--------|-----------------|----------------|")
+        for r in cacheblend_ratios:
+            name = cacheblend_method_name(r)
+            if name in per_method:
+                f1m, f1p = _agg(per_method[name]["f1"])
+                lm, lp = _agg(per_method[name]["prefill_ms"])
+                lines.append(f"| r={r:.2f} | {f1m:.4f} | {f1p:.4f} | {lm:.2f} | {lp:.2f} |")
+        lines.append("")
+
+    # ----- failure-only subset -----
+    lines.append("## Failure-only subset")
+    lines.append("")
+    lines.append(
+        "Examples where Full KV reuse F1 < Full recompute F1. This is "
+        "the subset where naive reuse loses quality, so it is where we "
+        "expect CacheBlend's selective recomputation to help."
+    )
+    lines.append("")
+    lines.append(f"- 갯수: {failure_subset['num_examples']}")
+    lines.append(f"- Full recompute F1 mean (subset): "
+                 f"{failure_subset['per_method_f1_mean'].get(METHOD_FULL_RECOMPUTE, float('nan')):.4f}")
+    lines.append(f"- Full KV reuse F1 mean (subset): "
+                 f"{failure_subset['per_method_f1_mean'].get(METHOD_FULL_KV_REUSE, float('nan')):.4f}")
+    for r in cacheblend_ratios:
+        name = cacheblend_method_name(r)
+        if name in failure_subset["per_method_f1_mean"]:
+            lines.append(
+                f"- CacheBlend r={r:.2f} F1 mean (subset): "
+                f"{failure_subset['per_method_f1_mean'][name]:.4f}"
+            )
+    if failure_subset["best_cacheblend_method"]:
+        lines.append(
+            f"- Best CacheBlend ratio (subset): "
+            f"`{failure_subset['best_cacheblend_method']}` "
+            f"@ {failure_subset['best_cacheblend_f1_mean']:.4f}"
+        )
+    lines.append("")
+
+    # ----- segment cache diagnostics -----
+    lines.append("## Segment cache diagnostics")
+    lines.append("")
+    lines.append(f"- evaluated examples: {seg_diag_summary['num_evaluated']}")
+    lines.append(f"- all six chunks cache-hit: {seg_diag_summary['all_six_chunks_hit_count']}")
+    lines.append(f"- real question segment cache-hit: {seg_diag_summary['real_question_hit_count']}")
+    lines.append(f"- prefix cache-hit: {seg_diag_summary['prefix_hit_count']}")
+    if seg_diag_summary["real_question_hit_count"] > 0:
+        lines.append("")
+        lines.append(
+            "**⚠ WARNING**: real question segment was cache-hit on "
+            f"{seg_diag_summary['real_question_hit_count']} example(s). "
+            "This invalidates the cache-eval interpretation — the model "
+            "would have seen the real question's KV reused from warmup."
+        )
+    lines.append("")
+
+    # ----- sanity checks -----
+    lines.append("## Sanity checks")
+    lines.append("")
+    f1_full = _f1_mean(METHOD_FULL_RECOMPUTE)
+    f1_reuse = _f1_mean(METHOD_FULL_KV_REUSE)
+    f1_r0 = _f1_mean(cacheblend_method_name(0.00)) if 0.00 in cacheblend_ratios else float("nan")
+    f1_r1 = _f1_mean(cacheblend_method_name(1.00)) if 1.00 in cacheblend_ratios else float("nan")
+    lines.append(f"- CacheBlend r=0.00 vs Full KV reuse F1 gap: "
+                 f"{(f1_r0 - f1_reuse):+.4f}")
+    lines.append(f"- CacheBlend r=1.00 vs Full recompute F1 gap: "
+                 f"{(f1_r1 - f1_full):+.4f}")
+    if math.isfinite(f1_r1) and math.isfinite(f1_full):
+        if abs(f1_r1 - f1_full) > 0.03:
+            lines.append("")
+            lines.append(
+                "**⚠ WARNING**: CacheBlend r=1.00 should approach Full recompute "
+                "(|gap| ≤ 0.03). The observed gap exceeds 0.03 — possible causes:"
+            )
+            lines.append("- HKVD selection still excludes some tokens at r=1.00.")
+            lines.append("- RoPE shift or layer-0 KV reuse leaves a residual signal.")
+            lines.append("- Prompt materialisation difference (sep id off-by-one, BOS).")
+            lines.append("- Generation seed mismatch (greedy should be deterministic).")
+    if seg_diag_summary["real_question_hit_count"] > 0:
+        lines.append("")
+        lines.append("**⚠ WARNING**: real question segment was cache-hit (see above).")
+    lines.append("")
+
+    # ----- quality gaps & latency ratios (kept from original) -----
+    lines.append("## Quality gaps (overall)")
+    f1_blend_015 = _f1_mean(cacheblend_method_name(0.15)) if 0.15 in cacheblend_ratios else float("nan")
+    lines.append(f"- CacheBlend r=0.15 minus Full recompute: {f1_blend_015 - f1_full:+.4f}")
+    lines.append(f"- Full KV reuse minus Full recompute:     {f1_reuse - f1_full:+.4f}")
+    lines.append(f"- CacheBlend r=0.15 minus Full KV reuse:  {f1_blend_015 - f1_reuse:+.4f}")
+    lines.append("")
+
+    def _safe_ratio(a: List[float], b: List[float]) -> float:
+        ma = mean(a) if a else float("nan")
+        mb = mean(b) if b else float("nan")
+        if not math.isfinite(mb) or mb == 0:
+            return float("nan")
+        return ma / mb
+
+    full_lat = per_method[METHOD_FULL_RECOMPUTE]["prefill_ms"]
+    reuse_lat = per_method[METHOD_FULL_KV_REUSE]["prefill_ms"]
+    lines.append("## Latency ratios (overall)")
+    lines.append(f"- Full KV reuse / Full recompute: {_safe_ratio(reuse_lat, full_lat):.3f}")
+    for r in cacheblend_ratios:
+        name = cacheblend_method_name(r)
+        if name in per_method:
+            lines.append(
+                f"- CacheBlend r={r:.2f} / Full recompute: "
+                f"{_safe_ratio(per_method[name]['prefill_ms'], full_lat):.3f}"
+            )
+    lines.append("")
+
+    # ----- skips -----
     lines.append("## Skip reasons")
     lines.append("")
     if skip_counts:
@@ -495,26 +823,6 @@ def _write_markdown(
             lines.append(f"| {reason} | {count} |")
     else:
         lines.append("(no skips)")
-    lines.append("")
-    lines.append("## Quality gaps")
-    f1_full_m = mean(per_method["full_recompute"]["f1"]) if per_method["full_recompute"]["f1"] else float("nan")
-    f1_reuse_m = mean(per_method["full_kv_reuse"]["f1"]) if per_method["full_kv_reuse"]["f1"] else float("nan")
-    f1_blend_m = mean(per_method["cacheblend"]["f1"]) if per_method["cacheblend"]["f1"] else float("nan")
-    lines.append(f"- CacheBlend minus Full recompute: {f1_blend_m - f1_full_m:+.4f}")
-    lines.append(f"- Full KV reuse minus Full recompute: {f1_reuse_m - f1_full_m:+.4f}")
-    lines.append(f"- CacheBlend minus Full KV reuse: {f1_blend_m - f1_reuse_m:+.4f}")
-    lines.append("")
-    # Latency ratios.
-    def _safe_ratio(a: List[float], b: List[float]) -> float:
-        ma = mean(a) if a else float("nan")
-        mb = mean(b) if b else float("nan")
-        if not math.isfinite(mb) or mb == 0:
-            return float("nan")
-        return ma / mb
-    lines.append("## Latency ratios")
-    lines.append(f"- Full KV reuse / Full recompute: {_safe_ratio(per_method['full_kv_reuse']['prefill_ms'], per_method['full_recompute']['prefill_ms']):.3f}")
-    lines.append(f"- CacheBlend / Full recompute:   {_safe_ratio(per_method['cacheblend']['prefill_ms'], per_method['full_recompute']['prefill_ms']):.3f}")
-    lines.append(f"- CacheBlend / Full KV reuse:    {_safe_ratio(per_method['cacheblend']['prefill_ms'], per_method['full_kv_reuse']['prefill_ms']):.3f}")
     lines.append("")
 
     Path(output_path).write_text("\n".join(lines), encoding="utf-8")
@@ -527,7 +835,8 @@ def main() -> int:
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    # Resolve prefix text.
+    cacheblend_ratios = parse_recompute_ratios(args.cacheblend_recompute_ratios)
+
     if args.prefix_file is not None:
         prefix = Path(args.prefix_file).read_text(encoding="utf-8")
     elif args.prefix is not None:
@@ -548,24 +857,27 @@ def main() -> int:
         model = model.to("cuda:0")
     model.eval()
 
-    # Cache the blend_special_str in the model's config so the pipeline
-    # builder can read it without threading args through.
     model.config._phase4_blend_special_str = args.blend_special_str
 
     model_max_len = args.max_model_len or getattr(model.config, "max_position_embeddings", 4096)
 
-    # Build the embedding model. Falls back to a deterministic
-    # hash-derived "embedding" if sentence-transformers isn't installed.
     embedder = _build_embedder(args.embedding_model, args.embedding_batch_size)
 
-    per_method = {
-        "full_recompute": {"f1": [], "prefill_ms": []},
-        "full_kv_reuse":  {"f1": [], "prefill_ms": []},
-        "cacheblend":     {"f1": [], "prefill_ms": []},
+    method_names: List[str] = [METHOD_FULL_RECOMPUTE, METHOD_FULL_KV_REUSE]
+    for r in cacheblend_ratios:
+        method_names.append(cacheblend_method_name(r))
+
+    per_method: Dict[str, Dict[str, List[float]]] = {
+        name: {"f1": [], "prefill_ms": []} for name in method_names
     }
+    per_example_records: List[Dict[str, Any]] = []
     skip_counts: Dict[str, int] = {}
     used = 0
     skipped = 0
+    real_question_hit_count = 0
+    all_six_hit_count = 0
+    prefix_hit_count = 0
+
     details_fp = None
     if args.write_jsonl_details is not None:
         Path(args.write_jsonl_details).parent.mkdir(parents=True, exist_ok=True)
@@ -577,6 +889,7 @@ def main() -> int:
             prefix_text=prefix,
             blend_special_str=args.blend_special_str,
             question_template=args.question_template,
+            dummy_warmup_query=args.dummy_warmup_query,
             num_chunks=args.num_chunks,
             seed=args.seed,
             embedder=embedder,
@@ -591,14 +904,13 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            # Stage B: tokenize.
             try:
                 materialized = materialize(
                     case, tokenizer,
                     tokenizer_name_or_path=args.model,
                     on_internal_separator=args.on_internal_separator,
                 )
-            except InternalSeparatorError as e:
+            except InternalSeparatorError:
                 skip_counts["internal_separator_error"] = skip_counts.get("internal_separator_error", 0) + 1
                 skipped += 1
                 continue
@@ -607,7 +919,6 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            # Prompt-fits-in-context check.
             total_first = len(materialized.first_prompt_ids)
             total_second = len(materialized.second_prompt_ids)
             if max(total_first, total_second) + args.max_new_tokens > model_max_len:
@@ -615,36 +926,56 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            # Run all three methods.
             try:
                 result = _per_example(
                     model, tokenizer, materialized,
                     max_new_tokens=args.max_new_tokens,
                     cacheblend_check_layers=[args.cacheblend_check_layers],
-                    cacheblend_recomp_ratios=[args.cacheblend_recomp_ratio],
+                    cacheblend_recompute_ratios=cacheblend_ratios,
                 )
-            except torch.cuda.OutOfMemoryError as e:  # noqa: F841
+            except torch.cuda.OutOfMemoryError:
                 skip_counts["oom"] = skip_counts.get("oom", 0) + 1
                 skipped += 1
                 gc.collect()
                 torch.cuda.empty_cache()
                 continue
 
-            for name in ("full_recompute", "full_kv_reuse", "cacheblend"):
-                per_method[name]["f1"].append(result["methods"][name]["f1"])
-                per_method[name]["prefill_ms"].append(result["methods"][name]["prefill_ms"])
+            for name in method_names:
+                if name in result["methods"]:
+                    per_method[name]["f1"].append(result["methods"][name]["f1"])
+                    per_method[name]["prefill_ms"].append(result["methods"][name]["prefill_ms"])
             used += 1
 
-            if details_fp is not None:
-                details_fp.write(json.dumps(result, ensure_ascii=False) + "\n")
-                details_fp.flush()
+            seg_diag = result.get("segment_diagnostics") or {}
+            if seg_diag.get("real_question_segment_cache_hit"):
+                real_question_hit_count += 1
+                seg_diag["invalid_example"] = True
+                print(
+                    f"WARN: example {case.id!r} — real question segment was a "
+                    "cache hit. Marking as invalid.",
+                    file=sys.stderr,
+                )
+            if seg_diag.get("all_six_chunks_cache_hit"):
+                all_six_hit_count += 1
+            if seg_diag.get("prefix_cache_hit"):
+                prefix_hit_count += 1
 
+            if details_fp is not None:
+                # Strip generated_ids out before JSONL write (they're huge).
+                slim = json.loads(json.dumps(result, ensure_ascii=False))
+                for name in slim.get("methods", {}):
+                    slim["methods"][name].pop("generated_ids", None)
+                details_fp.write(json.dumps(slim, ensure_ascii=False) + "\n")
+                details_fp.flush()
+            per_example_records.append(result)
+
+            f1_log = " ".join(
+                f"{name}={result['methods'][name]['f1']:.3f}"
+                for name in method_names if name in result["methods"]
+            )
             print(
                 f"[phase4] used={used}/{args.num_examples} skipped={skipped} "
-                f"f1: full={result['methods']['full_recompute']['f1']:.3f} "
-                f"reuse={result['methods']['full_kv_reuse']['f1']:.3f} "
-                f"blend={result['methods']['cacheblend']['f1']:.3f} "
-                f"id={case.id}"
+                f"id={case.id} | {f1_log}"
             )
 
             if used >= args.num_examples:
@@ -653,10 +984,23 @@ def main() -> int:
         if details_fp is not None:
             details_fp.close()
 
+    seg_diag_summary = {
+        "num_evaluated": used,
+        "real_question_hit_count": real_question_hit_count,
+        "all_six_chunks_hit_count": all_six_hit_count,
+        "prefix_hit_count": prefix_hit_count,
+    }
+    failure_subset = compute_failure_subset(per_example_records, method_names)
+
     _write_markdown(
         args.output, args=args, used=used, skipped=skipped,
         skip_counts=skip_counts, per_method=per_method,
+        method_names=method_names,
+        cacheblend_ratios=cacheblend_ratios,
+        seg_diag_summary=seg_diag_summary,
+        failure_subset=failure_subset,
     )
+
     print(f"[phase4] wrote markdown → {args.output}")
     return 0
 
