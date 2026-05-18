@@ -338,10 +338,17 @@ class TestRealModelEquivalence:
 
     # Parametrize at fixture level (pytest 9 rejects function-scoped
     # @parametrize on a class-scoped fixture — Phase 1 fix #4b3a751).
+    # Use distinct dtype tags ("fp16" / "bf16") rather than torch's own
+    # repr — pytest -k substring matching would otherwise let "float16"
+    # match "bfloat16", breaking the per-cell pytest split in
+    # scripts/run_phase2_remote.sh.
     @pytest.fixture(
         scope="function",
         params=[(m, d) for m in REAL_MODELS for d in DTYPES_REAL],
-        ids=lambda p: f"{p[0].rsplit('/', 1)[-1]}-{str(p[1]).split('.')[-1]}",
+        ids=lambda p: (
+            f"{p[0].rsplit('/', 1)[-1]}-"
+            f"{ {torch.float16:'fp16', torch.bfloat16:'bf16', torch.float32:'fp32'}[p[1]] }"
+        ),
     )
     def real_captures(self, request):
         model_name, dtype = request.param

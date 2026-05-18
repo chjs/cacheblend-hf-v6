@@ -78,10 +78,10 @@ run_one() {
 }
 
 # Tiny CPU regression — shares process with Mistral-fp16 (cheap).
-run_one "TinyModel or Mistral-7B-Instruct-v0.2 and float16" "$RESULTS/phase2_pytest_mistral_fp16.log"
-run_one "Mistral-7B-Instruct-v0.2 and bfloat16"             "$RESULTS/phase2_pytest_mistral_bf16.log"
-run_one "Meta-Llama-3.1-8B-Instruct and float16"            "$RESULTS/phase2_pytest_llama_fp16.log"
-run_one "Meta-Llama-3.1-8B-Instruct and bfloat16"           "$RESULTS/phase2_pytest_llama_bf16.log"
+run_one "TinyModel or (Mistral-7B-Instruct-v0.2 and fp16)" "$RESULTS/phase2_pytest_mistral_fp16.log"
+run_one "Mistral-7B-Instruct-v0.2 and bf16"                "$RESULTS/phase2_pytest_mistral_bf16.log"
+run_one "Meta-Llama-3.1-8B-Instruct and fp16"              "$RESULTS/phase2_pytest_llama_fp16.log"
+run_one "Meta-Llama-3.1-8B-Instruct and bf16"              "$RESULTS/phase2_pytest_llama_bf16.log"
 
 PYTEST_RC=$FAIL
 echo "pytest combined rc=$PYTEST_RC"
