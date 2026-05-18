@@ -342,8 +342,16 @@ class TestRealModelEquivalence:
     # repr — pytest -k substring matching would otherwise let "float16"
     # match "bfloat16", breaking the per-cell pytest split in
     # scripts/run_phase2_remote.sh.
+    #
+    # Scope is *class* (not function) so the K/V test and the
+    # final-hidden test share one model load. Function-scope teardown
+    # was observed to leave PyTorch's caching allocator at ~23 GB on
+    # the next fixture invocation despite gc.collect + empty_cache,
+    # so we rely on the per-cell pytest process split in
+    # scripts/run_phase2_remote.sh to isolate (model, dtype) pairs:
+    # each pytest cell selects exactly one param.
     @pytest.fixture(
-        scope="function",
+        scope="class",
         params=[(m, d) for m in REAL_MODELS for d in DTYPES_REAL],
         ids=lambda p: (
             f"{p[0].rsplit('/', 1)[-1]}-"
@@ -367,26 +375,14 @@ class TestRealModelEquivalence:
 
         yield captures
 
-        # Aggressive cleanup — function-scope keeps each fixture
-        # invocation isolated so an OOM in one (model, dtype) cell
-        # doesn't poison the next.
+        # Best-effort cleanup. With the per-cell pytest split this only
+        # has to free memory before the pytest process exits, but be
+        # defensive anyway.
         try:
             model.to("cpu")
         except Exception:
             pass
-        recorder = captures.get("recorder")
-        if recorder is not None:
-            recorder.vllm_model = None
-            if getattr(recorder, "_inner", None) is not None:
-                recorder._inner.vllm_model = None
-                recorder._inner.layerwise_model = None
-            recorder.layerwise_model = None
-        lmc = captures.get("lmc_model")
-        if lmc is not None:
-            lmc.vllm_model = None
-            lmc.blender = None
         captures.clear()
-        del captures, recorder, lmc, model
         gc.collect()
         torch.cuda.empty_cache()
 
