@@ -1,0 +1,24 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /usr/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/cacheblend-hf-v6
+configfile: pyproject.toml
+plugins: anyio-4.13.0, hypothesis-6.151.9
+collecting ... collected 13 items
+
+tests/test_phase4_rag_quality.py::test_musique_selects_all_supporting_paragraphs PASSED [  7%]
+tests/test_phase4_rag_quality.py::test_musique_fills_to_six_by_l2 PASSED [ 15%]
+tests/test_phase4_rag_quality.py::test_too_many_supporting_skip PASSED   [ 23%]
+tests/test_phase4_rag_quality.py::test_too_many_supporting_error PASSED  [ 30%]
+tests/test_phase4_rag_quality.py::test_reverse_order_policy PASSED       [ 38%]
+tests/test_phase4_rag_quality.py::test_separator_count_six_chunks PASSED [ 46%]
+tests/test_phase4_rag_quality.py::test_no_internal_separator_skip PASSED [ 53%]
+tests/test_phase4_rag_quality.py::test_no_internal_separator_error PASSED [ 61%]
+tests/test_phase4_rag_quality.py::test_tokenizer_independent_case_generation PASSED [ 69%]
+tests/test_phase4_rag_quality.py::test_chunk_token_ids_identical_across_orders PASSED [ 76%]
+tests/test_phase4_rag_quality.py::test_f1_basics PASSED                  [ 84%]
+tests/test_phase4_rag_quality.py::test_count_subsequence PASSED          [ 92%]
+tests/test_phase4_rag_quality.py::test_integration_smoke SKIPPED (In...) [100%]
+
+======================== 12 passed, 1 skipped in 1.03s =========================
