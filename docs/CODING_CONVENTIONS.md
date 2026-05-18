@@ -124,6 +124,22 @@ lmc/                              # mirrors lmcache/v1/
 Sibling top-level directories at the repo root (already exist):
 `tests/`, `scripts/`, `results/`, `docs/`, `reports/`.
 
+### `LMCStubBlender` (test-time only)
+
+`lmc/compute/blend/stub_blender.py` carries an `LMCStubBlender` class
+with the **Phase 1 stub constructor** `(hf_model, num_layers)`. It is
+used **only by Phase 1 / Phase 2 tests** to exercise the layerwise
+prefill skeleton (`compute_layer`) without standing up a cache engine,
+a segment DB, or a GPU connector — none of which exist at the time
+those tests run. Production code (Phase 3 onward) always uses the
+full `LMCBlender` from `lmc/compute/blend/blender.py`.
+
+The stub is a near-verbatim copy of LMCache's pre-HKVD prefix
+(`lmcache/v1/compute/blend/blender.py:59-86`), minus the HKVD branch
+and the `old_k[imp_indices] = k` write-back. Adding behaviour beyond
+RoPE to the stub is out of scope — anything more belongs on the full
+blender.
+
 ## Naming rules
 
 - Module path under `lmc/` mirrors `lmcache/v1/` exactly.

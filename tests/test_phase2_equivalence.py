@@ -36,7 +36,9 @@ from typing import Any
 import pytest
 import torch
 
-from lmc.compute.blend.blender import LMCBlender
+# Phase 2 also uses the stub blender (not the full Phase 3 one). See
+# Phase 5 report for the regression history.
+from lmc.compute.blend.stub_blender import LMCStubBlender as LMCBlender
 from lmc.compute.models.utils import infer_model_from_hf
 
 

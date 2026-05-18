@@ -232,10 +232,18 @@ def _run_cache_method(
         materialized.second_prompt_ids, dtype=torch.long, device=device,
     )
 
-    # Warmup: stash per-chunk KV under the first prompt's chunk hashes.
+    # ----- Warmup (no F1 measured) -----
+    # `stock_kv_first_prompt` was captured by a stock HF prefill on the
+    # FIRST prompt (`_per_example._stock_prefill(model, first_ids)`).
+    # We stash those per-chunk KVs into the LocalCPUBackend, keyed by
+    # each chunk's hash. The first prompt is never generated from.
     engine.store_from_prefill(first_prompt_ids, stock_kv_first_prompt)
 
-    # Run the blend on the second prompt; this is the "prefill" path.
+    # ----- Evaluation prefill on the SECOND prompt -----
+    # `blender.blend(...)` runs the layerwise prefill on the second
+    # prompt, reusing the cached chunk KVs (RoPE-shifted into the
+    # second prompt's chunk positions). The resulting fused KV is
+    # fed to the decoder to generate the answer that gets F1-scored.
     cuda = device.type == "cuda"
     if cuda:
         torch.cuda.synchronize()
@@ -309,7 +317,24 @@ def _per_example(
     cacheblend_check_layers: List[int],
     cacheblend_recomp_ratios: List[float],
 ) -> Dict[str, Any]:
-    """Run all three methods on the second prompt of one example."""
+    """
+    Run all three methods on **the second prompt** of one example.
+
+    Role split (made explicit by user request):
+      - `first_prompt_ids`  → **warmup only**. Stock HF prefill on this
+        prompt populates `LMCacheEngine` with per-chunk KV under the
+        chunks' hashes. No F1 is computed on this prompt.
+      - `second_prompt_ids` → **evaluation only**. All three methods
+        (Full recompute / Full KV reuse / CacheBlend) generate from
+        this prompt; F1 vs gold answer is computed on those generations.
+
+    The two prompts share prefix / separator / per-chunk token sequence /
+    question. The only thing that differs is chunk order:
+    `second_order = reversed(first_order)`. So cached chunk KVs from the
+    first prompt are reused at *different positions* in the second
+    prompt (the GPU connector applies `FusedRope` to shift K). The
+    quality of that position-shifted reuse is what F1 reflects.
+    """
     device = next(model.parameters()).device
     case = materialized.case
 
@@ -320,14 +345,20 @@ def _per_example(
         materialized.first_prompt_ids, dtype=torch.long, device=device,
     )
 
-    # ---- Method 1: Full KV recompute on the second prompt (model unpatched). ----
+    # ---- Method 1 (evaluation): Full KV recompute on the second prompt. ----
+    # Model is unpatched. F1 reference value for this example.
     text1, prefill1, gen1 = full_recompute_run(model, tokenizer, second_ids, max_new_tokens)
     f1_full = f1_with_aliases(text1, case.answer, case.answer_aliases)
 
-    # ---- Stock prefill on the first prompt → warmup KV for Methods 2 and 3. ----
+    # ---- Warmup (no F1 measured): stock prefill on the FIRST prompt. ----
+    # Captures per-layer K, V to seed the cache. Methods 2 and 3 reuse
+    # these chunk KVs (shifted to the second prompt's chunk positions
+    # via FusedRope inside the GPU connector). The first prompt is never
+    # generated from and never F1-scored.
     stock_kv_first = _stock_prefill(model, first_ids)
 
-    # ---- Method 2: Full KV reuse. ----
+    # ---- Method 2 (evaluation): Full KV reuse on the second prompt. ----
+    # Uses warmup KV from the first prompt; skips HKVD recomputation.
     text2, prefill2, gen2 = _run_cache_method(
         model, tokenizer, materialized,
         use_full_reuse=True,
@@ -339,7 +370,8 @@ def _per_example(
     )
     f1_reuse = f1_with_aliases(text2, case.answer, case.answer_aliases)
 
-    # ---- Method 3: CacheBlend. ----
+    # ---- Method 3 (evaluation): CacheBlend on the second prompt. ----
+    # Uses the same warmup KV, plus HKVD recomputation of 15% tokens.
     text3, prefill3, gen3 = _run_cache_method(
         model, tokenizer, materialized,
         use_full_reuse=False,

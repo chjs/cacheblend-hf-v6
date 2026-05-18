@@ -22,7 +22,13 @@ from typing import Optional
 import pytest
 import torch
 
-from lmc.compute.blend.blender import LMCBlender
+# Phase 1 / Phase 2 use the stub blender, not the full Phase 3 LMCBlender:
+# the layerwise-skeleton tests run before there is any cache engine /
+# GPU connector to construct a full blender. See
+# `lmc/compute/blend/stub_blender.py` (introduced in Phase 5 to undo a
+# Phase 3 regression — Phase 3's full LMCBlender swap broke these
+# Phase 1 / Phase 2 tests at the import-time keyword `num_layers`).
+from lmc.compute.blend.stub_blender import LMCStubBlender as LMCBlender
 from lmc.compute.blend.metadata import LMCBlendMetadata
 from lmc.compute.models.utils import infer_model_from_hf
 
