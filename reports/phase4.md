@@ -325,19 +325,167 @@ Per-example breakdown of the subset:
    이지만 N=5 에서는 너무 작은 sample. N=100 에서 ratio 별 F1 / latency
    curve 의 elbow 위치를 확인 필요.
 
-## 6. 다음 단계
+## 6. Loong 데이터셋 지원
 
-- [x] 단위 테스트 19/20 PASS (1 skipped CPU integration).
+> **재실험 추가 사유**: MuSiQue 의 짧은 prompt 길이 (1k token 안팎)
+> 만으로는 Full KV reuse vs CacheBlend 의 차이가 크게 드러나지 않을
+> 수 있다. Loong (long-context multi-document QA) 의 11 문서 / 8-32k
+> token prompt 가 차이를 더 강하게 노출할 가능성. 본 §6 은 그 확장
+> 작업과 결과를 기록.
+
+### 6.1 무엇을 추가했나
+
+- **scripts/_phase4_loong.py** (신규):
+  - `normalize_loong_example` — Loong JSONL 의 다양한 스키마를 견고
+    하게 정규화. `documents` / `contexts` / `passages` / `docs` /
+    `chunks` 등 다양한 키 이름 지원. dict-with-title-text, plain
+    string, list-of-strings 등 다양한 document shape 도 동일하게 처리.
+    스키마가 모호하면 `LoongSchemaError` 를 top-level keys 목록과
+    함께 raise.
+  - `select_loong_chunks` — chunk 개수 mismatch policy. `--loong-num-
+    chunks` 보다 많으면 `on_extra_chunks ∈ {first,skip,error}`, 적으면
+    `on_fewer_chunks ∈ {skip,error,use_all}`.
+  - `build_loong_case` — Stage A 진입점. `MusiqueCase` 와 호환되는
+    dataclass 를 `dataset="loong"` 으로 빌드. `first_order_policy ∈
+    {original, random}` 지원. `second_order` 는 항상 정확한 reverse.
+  - `iter_loong_cases` — JSONL 한 줄씩 yield `(case, skip_reason)`.
+  - `assign_length_bucket`, `prompt_token_budget` — 32k context budget
+    enforcement 와 0-8k / 8-16k / 16-24k / 24-32k 버킷 분류.
+- **scripts/run_rag_comparison.py** 변경:
+  - `--dataset {musique,loong}` 라우팅.
+  - Loong-specific CLI: `--loong-num-chunks`, `--loong-first-order`,
+    `--loong-on-extra-chunks`, `--loong-on-fewer-chunks`.
+  - `--safety-margin` (default 128). Budget = `max_model_len -
+    max_new_tokens - safety_margin`. 초과 시 `prompt_too_long` 로 skip.
+  - Loong 의 default `max_model_len = 32768` (Mistral-7B-v0.2 의 native
+    32k context window 그대로 사용).
+  - JSONL details 에 `prompt_lengths {first, second, max_model_len,
+    max_new_tokens, safety_margin, prompt_token_budget}` 와
+    `length_bucket` 추가 (Loong 전용).
+  - Markdown 헤더: `# Phase 4 — Loong RAG comparison` / `# Phase 4 —
+    MuSiQue RAG comparison` 데이터셋별 분기.
+  - 새 markdown 섹션 "Prompt length buckets" — 버킷별 F1 / latency.
+  - `all_six_chunks_hit_count` 키를 `all_chunks_hit_count` 로 rename
+    (Loong 은 11 chunks).
+- **tests/test_phase4_loong.py** (신규, 22 tests):
+  - schema 정규화 (documents / contexts / passages / 문자열 docs)
+  - missing fields → `LoongSchemaError`
+  - `answers: [...]` list 에서 aliases 추출
+  - first/second order original/random policy
+  - 11 chunks 의 separator count 12 검증
+  - dummy/real 분리 invariant (Loong 버전)
+  - extra/fewer chunks policy
+  - prompt_too_long synthetic
+  - budget / bucket boundary 테스트
+  - chunk text stable across orders
+
+기존 MuSiQue 테스트 (`test_phase4_rag_quality.py`) 는 그대로 PASS.
+전체 suite: **41 passed, 1 skipped** (Phase 1/2/3/5 합치면 59 passed,
+27 skipped).
+
+### 6.2 데이터셋 선정
+
+- 사용한 source: **[framolfese/Loong](https://huggingface.co/datasets/framolfese/Loong)**
+  — Loong 벤치마크의 영어 전용 subset. financial + paper 두 split,
+  총 695 examples.
+- 본 실험은 **financial split** 만 사용 (295 examples).
+- 이유: financial 의 정답은 `-$0.04`, `$10,135 in thousands` 같은
+  깔끔한 factoid → F1 평가가 의미 있음. paper split 의 정답은
+  `{"Reference": ["# TinyLlama..."], "Citation": [...]}` 같은 구조화된
+  JSON 으로 F1 측정에 적합하지 않음.
+- 32k context budget 안에 들어가는 *length < 80,000 chars* 인 62
+  examples 만 남기는 사전 필터링 적용 (charterer ≈ 0.3 token →
+  ~24k token 이하). 결과: 62 examples 사용 가능 (level: L1=8, L2=19,
+  L3=25, L4=10).
+- 변환 스크립트는 `framolfese/Loong` 의 parquet `docs` 필드를 `《j》`
+  separator 로 split → 각 part 를 `documents[i].text` 로 매핑, `doc`
+  필드의 회사명들을 `documents[i].title` 로 매핑.
+- 결과 JSONL `/tmp/loong_financial_under80k.jsonl` (21 MB, 62 lines).
+
+### 6.3 32k context budget 정책
+
+| 파라미터 | 값 |
+|---|---|
+| `--max-model-len` | 32768 (default for Loong + Mistral-7B-v0.2) |
+| `--max-new-tokens` | 32 |
+| `--safety-margin` | 128 |
+| `prompt_token_budget` | 32768 - 32 - 128 = **32608** |
+
+매 example 의 두 prompt 가 budget 을 초과하면 skip + reason
+`prompt_too_long` 카운트. 토큰 길이는 항상 *선택한 모델 토크나이저*
+로 측정 (char 길이 휴리스틱 사용 안 함).
+
+### 6.4 실험 명령
+
+```bash
+python scripts/run_rag_comparison.py \
+  --dataset loong \
+  --model mistralai/Mistral-7B-Instruct-v0.2 \
+  --input-jsonl /workspace/data/loong_financial.jsonl \
+  --num-examples 50 \
+  --dtype bfloat16 \
+  --max-model-len 32768 \
+  --max-new-tokens 32 \
+  --safety-margin 128 \
+  --output results/phase4_loong_n50.md \
+  --write-jsonl-details results/phase4_loong_n50_details.jsonl \
+  --cacheblend-recompute-ratios 0.0,0.05,0.15,0.30,0.50,1.00 \
+  --loong-num-chunks 3 \
+  --loong-first-order original \
+  --loong-on-extra-chunks first \
+  --loong-on-fewer-chunks use_all
+```
+
+설정 근거:
+- `--loong-num-chunks 3`: financial split 의 budget-fitting subset 에서
+  doc 개수가 거의 모두 2-3 개. 11 로 두면 모든 example 이 skip.
+  3 으로 두고 `on_fewer_chunks=use_all` 로 2-doc example 도 사용.
+- `--loong-first-order original`: dataset 순서 유지. Loong 의 doc 순서
+  는 의미 있는 것으로 가정 (Section / Exhibit 번호 등).
+- `--loong-on-extra-chunks first`: docs 가 더 많으면 처음 N 개 사용.
+
+### 6.5 Loong 환경
+
+| 항목 | 값 |
+|---|---|
+| Instance | vast.ai #37041190 (machine 55181, BC Canada) |
+| GPU | RTX 3090, 24 GB |
+| Hourly | $0.158/hr |
+| Model | `mistralai/Mistral-7B-Instruct-v0.2` |
+| Commit | `66f658f` |
+| Dataset | `framolfese/Loong` (financial split, length < 80000 chars subset) |
+
+### 6.6 Loong 결과 (진행 중)
+
+> 본 §6.6 는 N=50 main run 완료 후 채워질 placeholder. 표 형식은
+> §4.2 와 동일.
+
+| Method | F1 mean | F1 p50 | Prefill ms mean | Prefill ms p50 |
+|--------|---------|--------|-----------------|----------------|
+| Full recompute | TBD | TBD | TBD | TBD |
+| Full KV reuse  | TBD | TBD | TBD | TBD |
+| CacheBlend r=0.15 | TBD | TBD | TBD | TBD |
+
+(예정 추가 섹션: CacheBlend ratio sweep, Failure-only subset, Prompt
+length buckets, Segment cache diagnostics, Latency ratios, Sanity
+checks.)
+
+## 7. 다음 단계
+
+- [x] 단위 테스트 19/20 PASS (MuSiQue) + 22/22 PASS (Loong).
 - [x] N=5 smoke validation (cache invariant + sanity checks).
-- [ ] N=100 main run (진행 중).
-- [ ] N=100 결과로 §4.2 / §4.3 / §4.5 갱신.
+- [ ] MuSiQue N=100 main run (인스턴스 #37035954, 진행 중).
+- [ ] Loong N=50 main run (인스턴스 #37041190, 진행 중).
+- [ ] 두 run 완료 후 §4.2 / §4.3 / §4.5 / §6.6 갱신.
 - [ ] (선택) Llama-3.1-8B-Instruct 으로 동일 실험 반복.
 
-## 7. 참고
+## 8. 참고
 
-- Commit `1b93f86` (Phase 4 rerun design)
-- Commit `d555986` (cache-hit prefix + manual miss-tail split)
-- 단위 테스트 / 통합 smoke: 모두 동일 commit 에서 PASS.
-- vast.ai 인스턴스 #37035954 — N=100 완료 후 destroy 예정.
+- Commit `1b93f86` — Phase 4 rerun design (dummy warmup + ratio sweep + diagnostics).
+- Commit `d555986` — cache-hit prefix + manual miss-tail split.
+- Commit `66f658f` — Loong dataset support (`scripts/_phase4_loong.py`, tests, CLI routing).
+- 단위 테스트 / 통합 smoke: 모두 동일 commit set 에서 PASS.
+- vast.ai 인스턴스 #37035954 (MuSiQue N=100) — 완료 후 destroy 예정.
+- vast.ai 인스턴스 #37041190 (Loong N=50) — 완료 후 destroy 예정.
 
 작업 완료. 자세한 내용은 reports/phase4.md 참고.
