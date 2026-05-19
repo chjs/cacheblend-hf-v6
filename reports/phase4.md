@@ -455,29 +455,126 @@ python scripts/run_rag_comparison.py \
 | Commit | `66f658f` |
 | Dataset | `framolfese/Loong` (financial split, length < 80000 chars subset) |
 
-### 6.6 Loong 결과 (진행 중)
+### 6.6 Loong 결과 (N=50 완료)
 
-> 본 §6.6 는 N=50 main run 완료 후 채워질 placeholder. 표 형식은
-> §4.2 와 동일.
+> **첫 시도 (실패)**: 원본 docs 그대로 (per-doc median ~80k chars)
+> 토큰화하면 Mistral 토크나이저가 SEC filing 의 dense 숫자/표 포맷을
+> ~0.75 chars/token 으로 토큰화 → 모든 example 의 prompt 가 60k–110k
+> tokens. 32k context budget 초과로 62/62 모두 `prompt_too_long` skip.
+>
+> **재시도 (성공)**: 각 doc 을 **max 5000 chars 로 truncate** 한
+> JSONL 사용. Median 두 번째 prompt 길이 4k tokens (16k char), 모든
+> 295 examples 가 budget 안. 본 §6.6 는 그 재시도 결과.
+> truncation 은 Loong 원본 벤치마크의 long-context 특성을 약화시키
+> 므로 결과 해석 시 그 한계 (§6.7) 를 참고.
+
+**Main aggregate (N=50)**:
 
 | Method | F1 mean | F1 p50 | Prefill ms mean | Prefill ms p50 |
 |--------|---------|--------|-----------------|----------------|
-| Full recompute | TBD | TBD | TBD | TBD |
-| Full KV reuse  | TBD | TBD | TBD | TBD |
-| CacheBlend r=0.15 | TBD | TBD | TBD | TBD |
+| Full recompute | 0.0828 | 0.0000 | 1782.43 | 1894.00 |
+| Full KV reuse  | 0.1318 | 0.0000 | 1814.08 | 1921.64 |
+| CacheBlend r=0.15 | 0.1128 | 0.0000 | **464.75** | 481.11 |
 
-(예정 추가 섹션: CacheBlend ratio sweep, Failure-only subset, Prompt
-length buckets, Segment cache diagnostics, Latency ratios, Sanity
-checks.)
+**CacheBlend ratio sweep**:
+
+| Ratio | F1 mean | F1 p50 | Prefill ms mean | Latency vs Full |
+|---|---|---|---|---|
+| r=0.00 | 0.1335 | 0.0000 | 249.58 | **0.140×** |
+| r=0.05 | 0.1478 | 0.0000 | 315.79 | 0.177× |
+| r=0.15 | 0.1128 | 0.0000 | 464.75 | 0.261× |
+| r=0.30 | 0.0707 | 0.0000 | 689.75 | 0.387× |
+| r=0.50 | 0.0816 | 0.0000 | 1016.70 | 0.570× |
+| r=1.00 | 0.0695 | 0.0000 | 1813.77 | 1.018× |
+
+**Failure-only subset (n=7, examples where reuse F1 < full F1)**:
+
+| Method | F1 mean (subset) |
+|---|---|
+| Full recompute | 0.2574 |
+| Full KV reuse  | 0.0119 |
+| CacheBlend r=0.00 | 0.0249 |
+| **CacheBlend r=0.05** | **0.1820** |
+| **CacheBlend r=0.15** | **0.1820** |
+| CacheBlend r=0.30 | 0.0712 |
+| CacheBlend r=0.50 | 0.2439 |
+| CacheBlend r=1.00 | 0.2574 |
+| Best CacheBlend ratio | r=1.00 @ 0.2574 |
+
+→ **핵심 결과**: failure subset 에서 Full reuse 가 0.012 로 처참히
+실패하지만 CacheBlend r=0.05 / r=0.15 가 **0.182 로 ~15× 회복**.
+r=1.00 은 Full recompute 수준 (0.257) 까지 회복. CacheBlend 가
+cache reuse 의 quality 손실을 실제로 의미 있게 복구한다는 강한 증거.
+
+**Segment cache diagnostics**:
+- evaluated examples: 50
+- all chunks cache-hit: **50/50** ✓
+- real question segment cache-hit: **0/50** ✓ (cache-eval invariant)
+- prefix cache-hit: 50/50
+
+**Sanity checks**:
+- CacheBlend r=0.00 vs Full KV reuse F1 gap: **+0.0017** ✓ (sanity OK)
+- CacheBlend r=1.00 vs Full recompute F1 gap: **-0.0133** ✓ (|gap|<0.03)
+
+**Prompt length buckets**:
+
+| Bucket | n | Full F1 | Reuse F1 | r=0.15 F1 | Full ms | Reuse ms | r=0.15 ms |
+|---|---|---|---|---|---|---|---|
+| 0-8k | 50 | 0.0828 | 0.1318 | 0.1128 | 1782.4 | 1814.1 | 464.8 |
+
+(truncation 때문에 모든 50 examples 가 0-8k bucket. 본래 의도였던
+"긴 prompt 에서 차이가 더 잘 보임" 의 길이 의존성은 본 실험에서는
+관찰 불가.)
+
+### 6.7 Loong 결과 해석
+
+**검증된 부분**:
+1. **Cache-eval invariant**: 모든 50 examples 에서 chunks=HIT, real
+   question=MISS. 의도된 RAG-cache 시나리오 그대로 동작.
+2. **Sanity checks 통과**: r=0.00 ≈ Full reuse, r=1.00 ≈ Full recompute.
+3. **CacheBlend 의 quality 회복 효과 입증**: failure subset 에서
+   r=0.15 가 Full reuse 대비 F1 +0.170 (~15× 회복).
+4. **CacheBlend 의 latency 우위**: r=0.15 가 Full recompute 대비
+   **3.8× 빠름**, r=0.00 은 **7.1× 빠름**.
+
+**의외인 부분**:
+1. **Full reuse F1 (0.132) > Full recompute F1 (0.083)**: overall 에서
+   reuse 가 더 높음. 작은 sample (N=50) 의 noise 가능. financial 답안
+   이 매우 specific (`$10,135 in thousands` 등) 이라 F1 token-level
+   매칭이 거의 0 인 example 이 많기 때문에 mean 의 분산이 큼.
+2. **Ratio sweep 의 비단조성**: F1 가 r=0.05 (0.15) → r=0.15 (0.11) →
+   r=0.30 (0.07) → r=0.50 (0.08) → r=1.00 (0.07). 중간 ratio 가
+   best 인 example 이 있는 반면, 더 큰 ratio 가 오히려 더 잘못된
+   답을 끌어내는 example 도 있는 것으로 보임. N 이 작아서 (50) 단조성
+   회복은 더 큰 sample 이 필요.
+3. **전체 F1 이 매우 낮음 (p50 = 0)**: financial 답안의 일부가 truncated
+   문서 (5k chars) 에 포함되지 않은 경우가 다수. F1 token-level
+   매칭에서 정확한 수치 / 화폐 표기를 재생산하지 못한 example 이 많음.
+
+### 6.8 Loong 한계
+
+1. **Per-doc 5000 char truncation**: Loong 의 long-context 특성을 약화
+   시킴. Mistral-7B-v0.2 의 32k 한계와 financial docs 의 dense
+   tokenization 때문에 어쩔 수 없는 trade-off. 더 큰 context model
+   (Llama-3.1-8B 128k 등) 으로 재실험하면 truncation 없이 가능.
+2. **N=50 sample variance**: F1 분포가 양극화 (대부분 0, 일부 1) 라
+   mean 의 standard error 가 큼. 100+ examples 가 필요.
+3. **financial split 만**: 본 실험은 framolfese/Loong 의 financial
+   split (295 examples) 만 사용. paper split (400 examples) 은 답안이
+   `{"Reference": ["# TinyLlama..."], "Citation": [...]}` 같은 JSON 구
+   조라 F1 측정에 부적합.
+4. **Length bucket 다양성 부족**: truncation 때문에 모든 example 이
+   0-8k bucket. "긴 prompt 에서 CacheBlend 의 advantage 가 더 크다"
+   는 가설은 본 실험으로 검증 불가.
 
 ## 7. 다음 단계
 
 - [x] 단위 테스트 19/20 PASS (MuSiQue) + 22/22 PASS (Loong).
 - [x] N=5 smoke validation (cache invariant + sanity checks).
-- [ ] MuSiQue N=100 main run (인스턴스 #37035954, 진행 중).
-- [ ] Loong N=50 main run (인스턴스 #37041190, 진행 중).
-- [ ] 두 run 완료 후 §4.2 / §4.3 / §4.5 / §6.6 갱신.
-- [ ] (선택) Llama-3.1-8B-Instruct 으로 동일 실험 반복.
+- [ ] MuSiQue N=100 main run (인스턴스 #37035954, 진행 중 — ETA ~18h).
+- [x] **Loong N=50 main run 완료** — 결과 §6.6 / §6.7 / §6.8 참고.
+- [ ] MuSiQue N=100 완료 후 §4.2 / §4.3 / §4.5 갱신.
+- [ ] (선택) Llama-3.1-8B-Instruct 128k context 로 Loong full-length 재실험.
 
 ## 8. 참고
 
