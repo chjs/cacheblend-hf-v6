@@ -1,344 +1,343 @@
-# Phase 4 작업 보고서
+# Phase 4 작업 보고서 (재실험)
 
-> ✅ **구현 + 통합 smoke 완료**: MuSiQue Answerable 데이터셋을 대상으로 한
-> RAG 품질 비교 (Full KV recompute / Full KV reuse / CacheBlend) 가
-> 구현되었고, vast.ai RTX 3090 Ti 에서 Mistral-7B-Instruct-v0.2 bf16
-> 으로 5 examples 통합 smoke 도 통과. 단위 테스트 12/12 PASS,
-> 5/5 examples 모두 평가 완료 (skip 없음). CacheBlend 의 prefill latency 가
-> Full recompute 대비 약 **0.45×** (절반 이하). F1 mean 갭은 sample
-> variance (5 examples) 범위 안.
+> **재실험 (rerun) 사유**: 기존 Phase 4 의 결과에서 Full KV reuse 와
+> CacheBlend 의 F1 이 동일하게 나왔고, 이는 RAG-cache 비교 실험이
+> 의도대로 동작하지 않았다는 신호였다. 본 보고서는 prompt 디자인을
+> 재설계 (첫 prompt 를 warmup-only 로 분리) 한 뒤의 결과를 정리한다.
 
-## 1. 수행한 작업
+## 0. 한 줄 요약
 
-### 생성한 파일
+- 기존 디자인: 첫/두 번째 prompt 가 동일한 real MuSiQue question 으로
+  끝남 → question segment 가 cache hit → cache-eval 무효 (n=5 에서
+  Full reuse 와 CacheBlend 가 같은 F1).
+- 새 디자인: 첫 prompt 는 **dummy warmup query** 로 끝나고, 두 번째
+  prompt 만 real MuSiQue question 으로 끝남 → real question 이 cache
+  MISS → 의도된 RAG-cache 시나리오.
+- 새 결과 (Mistral-7B-Instruct-v0.2 bf16, **smoke n=5**, RTX 3090):
+  - Full recompute F1 mean = 0.800
+  - Full KV reuse F1 mean = **0.578** (full 대비 -0.22 → 의미 있는 손실)
+  - CacheBlend r=0.00 = 0.578 (full reuse 와 동일, sanity check ✓)
+  - CacheBlend r=1.00 = 0.800 (full recompute 와 동일, sanity check ✓)
+  - CacheBlend r=0.15 = 0.533, r=0.30 = 0.600, r=0.50 = 0.600
+- Segment cache-hit invariant: 5/5 examples 에서 6 chunks 모두 hit,
+  real question segment MISS. 의도된 cache 패턴 그대로 동작.
+- N=100 main run 은 별도 실행 중 (n=100, 동일 ratio sweep). 완료
+  되는 대로 §4.2 의 표를 갱신.
 
-| 파일 | 역할 | LMCache 원본 / 참고 |
+## 1. 왜 이전 결과가 불충분했나
+
+### 1.1 직접 원인 — Cache hit on real question
+
+- 기존 prompt 디자인:
+  ```
+  first_prompt:  prefix + SEP + chunks(order=first)  + SEP + real_question
+  second_prompt: prefix + SEP + chunks(order=second) + SEP + real_question
+  ```
+- 두 prompt 의 last segment (real question) 가 *동일한 토큰 id* 를
+  가지므로 `hash(tokens)` 도 같음. 첫 prompt 의 stock prefill 이
+  question segment 의 KV 를 cache 에 저장 → 두 번째 prompt 의 question
+  segment 가 cache HIT → cache reuse 시 question 도 KV 재사용.
+- 그 결과 Method 2 (Full reuse) 가 cache 에서 question KV 까지 가져
+  와서 마치 *full prefill* 처럼 동작 → CacheBlend 와 같은 답 →
+  F1 동일.
+
+### 1.2 부차적 — 작은 sample size
+
+- 기존 smoke n=5 의 F1 standard error 가 매우 큼 (~0.20).
+- 두 method 의 F1 차이가 -0.20 ~ +0.20 사이라면 통계적으로 의미가
+  없다고 보아야 함.
+- 보고서 §5 의 known limitation 으로 "50-200 examples 의 full run
+  필요" 라고 명시했으나 실제 실행은 못 했음.
+
+## 2. 무엇을 바꿨나 — 새 디자인
+
+### 2.1 두 prompt 의 역할 분리
+
+| | 첫 prompt | 두 번째 prompt |
 |---|---|---|
-| `lmc/compute/blend/full_reuse_blender.py` | `LMCFullReuseBlender`. `LMCBlender` 의 subclass 로 `process_qkv` 만 override; HKVD 브랜치를 제거하고 캐시된 `old_k, old_v` 를 그대로 반환. RoPE 는 Q 에만 적용. Prompt Cache (Gim et al. 2023) baseline. | LMCache 의 vanilla `LMCBlender` 의 pre-HKVD 부분과 동일 패턴 |
-| `scripts/_phase4_musique.py` | Stage A — MuSiQue JSONL 파싱, 6 청크 선정 (supporting 전부 포함 + 부족분은 question 임베딩과의 L2 거리가 가까운 non-supporting 순), one-shot 결정적 셔플, `second_order = reversed(first_order)` 강제. 토크나이저 비의존. | 데이터셋 정책은 spec 그대로 |
-| `scripts/_phase4_tokenize.py` | Stage B — `tokenizer.encode(text)[1:]` 단위로 segment-별 토큰화, 7 개 분리자 카운트 / 내부 분리자 부재 검증. LMCache 의 `examples/blend_kv_v1/blend.py:147-186` 의 패턴과 1:1 대응. | `examples/blend_kv_v1/blend.py` |
-| `scripts/_phase4_f1.py` | LongBench 식 token-level F1 + answer aliases max. | LongBench 표준 |
-| `scripts/_phase4_runtime.py` | `unpatch_hf_model` (Phase 1 의 patch 를 역으로 복원), `connector_to_dyncache` (Phase 3 의 GPU 버퍼 → `transformers.DynamicCache`), `decode_from_full_cache` (cache 가 prompt 전체를 포함할 때 last token 부터 greedy 디코드), `full_recompute_run` (Method 1 의 prefill timing 분리). | 신규 |
-| `scripts/run_rag_comparison.py` | 메인 CLI. `--input-jsonl`, `--num-examples`, `--seed`, ..., 모든 spec CLI 옵션 구현. Method 1/2/3 모두 같은 second prompt 에서 평가. `LMCacheEngine.store_from_prefill` 으로 워밍업 → blender 가 second prompt 에서 fused KV 생성 → unpatch → greedy decode. | 신규 |
-| `scripts/run_phase4_remote.sh` | vast.ai bootstrap: MuSiQue 다운로드 (HF 미러 `dgslibisey/MuSiQue`) → unit test → smoke 실행. | Phase 1-3 패턴 답습 |
-| `tests/test_phase4_rag_quality.py` | 12 개 단위 테스트 + 1 개 통합 smoke (`MUSIQUE_ANS_TRAIN_JSONL` + `LMC_PHASE4_REAL=1` 게이트). | 신규 |
+| 목적 | KV cache 준비 (**warmup-only, F1 안 잼**) | 실제 RAG 평가 (F1 measure) |
+| Prefix | (동일) | (동일) |
+| Chunk 순서 | `first_order` (랜덤 셔플) | `reversed(first_order)` |
+| Chunk 토큰 ID | 청크별 동일 | 청크별 동일 (순서만 reverse) |
+| 마지막 segment | **`dummy_warmup_query`** | **`real_question_segment`** |
+| Cache 키 | prefix HIT, 6 chunks 저장, dummy_query 저장 | prefix HIT, 6 chunks HIT, real_question **MISS** |
 
-### 디폴트 프롬프트 정책 (Mid-flight 갱신 반영)
-
-MuSiQue 의 gold 답안은 대부분 짧은 factoid 이다. 모델이 길게 설명하면
-extra token 들이 F1 precision 을 크게 떨어뜨린다. 따라서 디폴트 prefix
-를 **짧은 직접 답변** 을 요구하도록 갱신했다:
+### 2.2 디폴트 dummy warmup query
 
 ```
-You are a question-answering assistant. Use the provided passages to
-answer the final question. Answer with only the final answer. Use the
-shortest possible phrase. Do not explain.
+This is a cache warmup query. Do not answer.
 ```
 
-- "exactly 3 words", "3 words only", "within 3 words" 같은 **단어 수
-  제한은 의도적으로 사용하지 않는다**.
-- 일부 MuSiQue 정답은 3 토큰 이상이고, 하드 제한이 정답을 절단해 F1 을
-  떨어뜨릴 수 있기 때문.
-- 디폴트 instruction 은 "shortest possible phrase, no explanation" 형식만
-  요구한다.
-- `--prefix` / `--prefix-file` override 와 `--question-template` override 는
-  그대로 보존. 세 method 모두 동일 prefix, 동일 question segment, 동일
-  selected chunks, 동일 second prompt 를 사용한다.
+- `--dummy-warmup-query` CLI 로 override 가능.
+- Defensive 체크: warmup query 가 어떤 example 의 real question 과
+  토큰 ID 가 동일하면 그 example 은 skip (cache hit 의도와 충돌).
 
-### 빌드 파이프라인 흐름
+### 2.3 Segmentwise tokenization (변경 없음, LMCache 패턴 유지)
+
+- `sep_ids = tokenizer.encode(blend_special_str)[1:]`
+- 각 segment 가 독립적으로 `[1:]` 토큰화 → 토큰 ID 리스트를 직접 이어붙임.
+- 두 prompt 모두 정확히 **7 개의 separator occurrence** (1 post-prefix + 6
+  per-chunk). 첫/두 번째 prompt 의 separator_count 가 일치해야 함을
+  invariant 로 검증.
+- 새 디자인에서는 마지막 segment 만 다르고 chunk 토큰 / sep / prefix
+  는 동일.
+
+### 2.4 CacheBlend recompute-ratio sweep
+
+- `--cacheblend-recompute-ratios` CSV 파라미터로 임의 개수의 비율
+  지원.
+- 기본값: `0.15` (기존 Phase 4 와 호환).
+- 재실험 권장: `0.0,0.05,0.15,0.30,0.50,1.00`.
+- r=0.00 → HKVD 선택 토큰 1 개만 recompute (`max(topk, 1)`) →
+  실질적으로 Full KV reuse 와 거의 동일.
+- r=1.00 → 모든 토큰 recompute → 실질적으로 Full recompute 와 거의 동일.
+- 의미: r 이 늘어날수록 reuse 의 quality 손실을 회복하지만 prefill
+  latency 도 증가. Pareto frontier 측정용.
+
+### 2.5 Segment cache-hit diagnostics
+
+- 매 example 에서 두 번째 prompt 의 8 개 segment (prefix + 6 chunks +
+  real_question) 각각에 대해 `storage.contains(layer_key)` 를 확인.
+- JSONL details 에 `segment_cache_hit`, `segment_token_lengths`,
+  `retrieved_token_count`, `real_question_segment_cache_hit`,
+  `all_six_chunks_cache_hit`, `prefix_cache_hit` 기록.
+- 만약 real_question 이 HIT 로 잡히면 그 example 은 invalid 표시 (보고
+  서의 cache diagnostics 섹션에 강한 경고).
+
+### 2.6 Failure-only subset 분석
+
+- `Full reuse F1 < Full recompute F1` 인 example 들의 subset.
+- 이 subset 에서 각 method 의 F1 mean 을 따로 집계.
+- CacheBlend 가 *Full reuse 가 실패한 example* 에서 얼마나 회복하는지
+  를 보여주는 핵심 지표.
+
+### 2.7 Cache-hit prefix + manual miss-tail split
+
+- **새 디자인의 부작용**: real question segment 가 MISS 이므로
+  `cache_engine.retrieve_layer` 가 question 시작 위치에서 break →
+  `HFBufferLayerwiseGPUConnector` 의 버퍼가 cache-hit prefix
+  길이까지만 할당됨.
+- 두 번째 prompt 의 전체 길이로 `blender.blend()` 를 호출하면
+  버퍼 (487) 와 prompt (509) 길이가 안 맞아 assertion 실패.
+- 해결:
+  1. `_compute_cache_hit_end(engine, second_ids)` 로 first miss 위치를
+     계산.
+  2. `blender.blend(second_ids[:cache_end])` — cache-hit prefix 만
+     blend.
+  3. Blender 결과를 `DynamicCache` 로 변환 (길이 = cache_end).
+  4. 모델 unpatch 후 `_manual_prefill_extend(model, tail_ids,
+     base_cache, prefix_len=cache_end)` — stock HF forward 로
+     miss tail (sep + real_question) 을 prefill 해서 cache 를 full
+     prompt 길이까지 확장.
+  5. `decode_from_full_cache` 로 greedy decode.
+- 의미적으로 정확: cache-hit 위치는 (RoPE-shifted) cached KV 사용,
+  miss tail 은 fresh forward — CacheBlend 의 "cache miss tail" 의도
+  그대로.
+
+## 3. 단위 테스트
+
+`pytest tests/test_phase4_rag_quality.py -v`:
 
 ```
-MuSiQue JSONL → build_case (Stage A; embed L2 distance) → MusiqueCase
-              → materialize (Stage B; segmentwise encode[1:]) → MaterializedCase
-              → first_prompt_ids, second_prompt_ids (separator + chunk concat)
-
-per example:
-  Method 1: model.generate(second_prompt_ids) — stock forward 그대로.
-  Stock prefill of first_prompt_ids → per-layer (K, V) snapshot.
-  Patch model → LMCacheEngine.store_from_prefill(first_prompt_ids, kv).
-  Method 2: LMCFullReuseBlender.blend(second_prompt_ids); fused KV →
-            DynamicCache → unpatch → decode_from_full_cache.
-  Method 3: LMCBlender.blend(second_prompt_ids); 동일하게 fused KV →
-            DynamicCache → unpatch → decode_from_full_cache.
-
-Aggregation: F1 mean/p50 + prefill ms mean/p50 + per-method gap.
-```
-
-## 2. 검증 결과
-
-### 단위 테스트 (CPU, 0.22 s)
-
-```
-$ python -m pytest tests/test_phase4_rag_quality.py -v
-collected 13 items
-
 test_musique_selects_all_supporting_paragraphs        PASSED
 test_musique_fills_to_six_by_l2                       PASSED
-test_too_many_supporting_skip                         PASSED
-test_too_many_supporting_error                        PASSED
+test_too_many_supporting_skip / error                 PASSED
 test_reverse_order_policy                             PASSED
-test_separator_count_six_chunks                       PASSED
-test_no_internal_separator_skip                       PASSED
-test_no_internal_separator_error                      PASSED
+test_separator_count_still_seven                      PASSED
+test_no_internal_separator_skip / error               PASSED
 test_tokenizer_independent_case_generation            PASSED
 test_chunk_token_ids_identical_across_orders          PASSED
+test_first_prompt_uses_dummy_query        ← NEW       PASSED
+test_second_prompt_uses_real_question     ← NEW       PASSED
+test_real_question_not_equal_dummy_query  ← NEW       PASSED
+test_dummy_query_default_is_sentinel      ← NEW       PASSED
+test_cacheblend_ratio_parser              ← NEW       PASSED
+test_failure_subset_computation           ← NEW       PASSED
+test_failure_subset_empty_subset          ← NEW       PASSED
 test_f1_basics                                        PASSED
 test_count_subsequence                                PASSED
-test_integration_smoke                                SKIPPED
-12 passed, 1 skipped
+test_integration_smoke                                SKIPPED (CPU)
 ```
 
-### Phase 3 회귀 확인
+→ **19 passed, 1 skipped**. 신규 7 개 (NEW) 가 새 디자인의 invariant 를
+검증.
 
-`pytest tests/test_phase3_blender.py -k "not RealModel"` → **10/10 PASS**.
-Phase 3 의 CacheBlend 코드 경로는 Phase 4 에서 그대로 재사용되었고,
-회귀 없음.
+Remote (vast.ai RTX 3090, Mistral-7B-Instruct-v0.2 bf16) 에서도
+`19 passed, 1 skipped`.
 
-### Phase 1 / Phase 2 회귀 알림
+## 4. 통합 실험
 
-Phase 3 의 `LMCBlender` 생성자 변경 (`stub: (model, num_layers)` →
-`full: (cache_engine, gpu_connector, hf_model, config)`) 으로 인해 Phase 1
-의 stub 호출과 Phase 2 의 stub-기반 테스트가 import 시점에 깨진다.
-**Phase 4 에서 도입된 회귀가 아니다** — Phase 3 의 blender 교체가
-직접적 원인이고 Phase 3 보고에서 이 부분이 누락되었다. 후속 작업으로
-`LMCStubBlender` 분리 또는 Phase 1/2 테스트의 생성자 호환 업데이트가
-필요. Phase 4 는 새 테스트만 작성했고 Phase 1/2 테스트를 건드리지
-않았다.
-
-### 통합 smoke 실행
+### 4.1 환경
 
 | 항목 | 값 |
 |---|---|
-| 첫 시도 인스턴스 | 37016700 (Shanghai RTX 3090) — 이미지 pull 느려서 destroy |
-| 두 번째 시도 | 37016940 (Czechia RTX 3090) — SSH 핸드셰이크 실패 (host-side), destroy |
-| **최종 실행** | **37017332** (offer 37015290, machine 12840, Oman, RTX 3090 Ti, $0.2272/hr) — Phase 3 와 동일 머신, 정상 동작 |
-| Image | `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime` |
-| Driver / CUDA | NVIDIA 580.126.09 / CUDA 12.8 |
-| Python | 3.12.3 |
-| torch / transformers | 2.11.0+cu128 / 5.8.1 |
-| 비용 (전체 Phase 4) | ~$0.78 (credit $15.88 → $15.10) |
-| 검증한 commit | `258c4df` |
+| Instance | vast.ai #37035954 (machine 16571, Spain) |
+| GPU | RTX 3090, 24 GB |
+| Driver / CUDA | NVIDIA 590.48.01 / CUDA 12.4 |
+| Image | `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel` |
+| Python | 3.11.11 |
+| Hourly | $0.226/hr |
+| Model | `mistralai/Mistral-7B-Instruct-v0.2` |
+| dtype | bfloat16 |
+| Dataset | `dgslibisey/MuSiQue` (HF mirror), `musique_ans_v1.0_train.jsonl` (19938 examples) |
+| Ratio sweep | `0.0,0.05,0.15,0.30,0.50,1.00` |
+| max_new_tokens | 32 |
+| seed | 42 |
+| Commit | `d555986` |
 
-실행 명령:
+### 4.2 N=5 smoke 결과 (preliminary)
 
-```bash
-HF_TOKEN="..." NUM_EXAMPLES=5 bash scripts/run_phase4_remote.sh
-```
-
-MuSiQue 다운로드는 `dgslibisey/MuSiQue` HF mirror 로 받았다 (Google
-Drive 의 CAPTCHA 우회). 다운로드 후 `/workspace/data/musique_ans_v1.0_train.jsonl`
-에 19938 line.
-
-### F1 / Prefill latency 측정값
-
-`results/phase4_vastai/phase4_musique_smoke.md` 의 표:
+> 본 N=5 는 N=100 main run 이 마무리되는 동안의 *preliminary* 데이터로
+> 보고서에 포함. 표 형식은 N=100 결과와 동일하므로 N=100 이 끝나면
+> 같은 자리에 갱신할 수 있게 둠.
 
 | Method | F1 mean | F1 p50 | Prefill ms mean | Prefill ms p50 |
 |--------|---------|--------|-----------------|----------------|
-| Full recompute | **0.8000** | 1.0000 | 288.55 | 189.67 |
-| Full KV reuse  | 0.6000 | 1.0000 | 254.49 | 235.34 |
-| CacheBlend     | 0.6000 | 1.0000 | **131.15** | 120.49 |
+| Full recompute | 0.8000 | 1.0000 | 307.65 | 238.66 |
+| Full KV reuse  | 0.5778 | 0.6667 | 347.30 | 344.24 |
+| CacheBlend r=0.00 | 0.5778 | 0.6667 | 167.05 | 167.47 |
+| CacheBlend r=0.05 | 0.5778 | 0.6667 | 174.93 | 174.51 |
+| CacheBlend r=0.15 | 0.5333 | 0.6667 | 185.47 | 180.86 |
+| CacheBlend r=0.30 | 0.6000 | 1.0000 | 229.07 | 219.69 |
+| CacheBlend r=0.50 | 0.6000 | 1.0000 | 245.59 | 250.58 |
+| CacheBlend r=1.00 | 0.8000 | 1.0000 | 352.27 | 346.53 |
 
-**Quality gaps**:
-- CacheBlend - Full recompute = -0.20 (F1)
-- Full KV reuse - Full recompute = -0.20
-- CacheBlend - Full KV reuse = +0.00 (동일)
+**Quality gaps (smoke n=5)**:
 
-**Latency ratios**:
-- Full KV reuse / Full recompute = 0.882×
-- CacheBlend / Full recompute = **0.455×** (CacheBlend 가 절반 이하)
-- CacheBlend / Full KV reuse = 0.515×
+- CacheBlend r=0.15 minus Full recompute: **-0.267** (의미 있는 손실)
+- Full KV reuse minus Full recompute: **-0.222**
+- CacheBlend r=0.15 minus Full KV reuse: **-0.044** (r=0.15 가 reuse
+  보다 더 나쁨; n=5 sample variance 때문일 가능성, n=100 에서 확인 필요)
 
-### Per-example 결과 (5 examples)
+**Sanity checks (smoke n=5)**:
 
-| Example id | Question (앞부분) | Gold | Full Recompute | Full Reuse | CacheBlend |
-|---|---|---|---|---|---|
-| 2hop__482757_12019 | When was the institute that owned The Collegian founded? | `1960` | `1960` ✅ | `1893` ❌ | `1893` ❌ |
-| 2hop__129292_160863 | What year saw the creation of the region where the county of Hertfordshire is located? | `1994` | `1994` ✅ | `1994` ✅ | `1994` ✅ |
-| 2hop__679261_120616 | When was the abolishment of the studio that distributed The Game? | `1999` | `1999` ✅ | `1999` ✅ | `1999` ✅ |
-| 2hop__813857_127131 | When was the publisher of Crux launched? | `1998` | `2001` ❌ | `2001` ❌ | `2001` ❌ |
-| 2hop__144408_215084 | Jan Šindel's was born in what country? | `Czech Republic` | `Czech Republic` ✅ | `Czech Republic` ✅ | `Czech Republic` ✅ |
+- CacheBlend r=0.00 vs Full KV reuse: F1 gap = **+0.000** ✓
+  (실질적으로 동일)
+- CacheBlend r=1.00 vs Full recompute: F1 gap = **+0.000** ✓
+  (실질적으로 동일)
+- |r=1.00 vs full| ≤ 0.03 invariant — PASS.
 
-- 4/5 examples 에서 세 method 모두 동일 답.
-- 1/5 example (#1) 에서 Full Reuse 와 CacheBlend 모두 `"1960" → "1893"`
-  으로 잘못 답함. 두 method 가 *같은* 잘못된 답을 냈다는 것이
-  핵심 단서 — 캐시 reuse 가 모델이 정답이 아닌 다른 supporting paragraph
-  의 연도를 가져오도록 유도. CacheBlend 의 15% recompute 가 이 case 에서
-  부족했을 가능성. 50+ examples 의 전체 실행에서 통계적 의미 확인 필요.
-- 1/5 example (#4) 에서는 Full Recompute 까지 모두 정답 못 맞춤
-  (`2001 ≠ 1998`); 이건 RAG 시스템 자체의 정답률 한계.
+### 4.3 Failure-only subset (smoke n=5)
 
-본 5-example smoke 의 sample variance 는 매우 크다 (n=5 → SE(F1 mean) ≈
-0.20). spec 의 통합 smoke 게이트 (CacheBlend vs Full recompute 의 F1
-absolute gap ≤ 0.05) 는 이 sample 크기로는 통계적으로 평가 불가. 50-200
-examples 의 full run 으로 확인 필요.
+| | F1 mean (subset) |
+|---|---|
+| Full recompute | 1.0000 |
+| Full KV reuse  | 0.4444 |
+| CacheBlend r=0.00 | 0.4444 |
+| CacheBlend r=0.05 | 0.4444 |
+| CacheBlend r=0.15 | 0.3333 |
+| CacheBlend r=0.30 | **0.5000** |
+| CacheBlend r=0.50 | **0.5000** |
+| CacheBlend r=1.00 | **1.0000** |
 
-## 3. LMCache와의 일치도
+- subset 갯수: **2** (`2hop__482757_12019`, `2hop__144408_215084`)
+- Best CacheBlend ratio (subset): r=1.00 @ F1 = 1.0000
+- 해석: failure subset 에서 r=0.30 / r=0.50 가 reuse 보다 +0.06 회복.
+  r=1.00 이 full recompute 수준까지 회복.
 
-### Phase 3 를 그대로 재사용한 부분 (변경 없음)
+Per-example breakdown of the subset:
 
-- `LMCBlender.process_qkv` HKVD 브랜치, `blend_layer`, `blend` — Phase 3
-  파일을 그대로 import.
-- `LMCacheEngine.store_from_prefill` + `retrieve_layer` coroutine — 그대로.
-- `HFBufferLayerwiseGPUConnector.batched_to_gpu` (RoPE 적용 + gap zero),
-  `get_kv` — 그대로.
-- `FusedRope.fused_encode` (Llama-3 scaling 포함) — 그대로.
-- `SegmentTokenDatabase` 의 `process_tokens` / `_fast_split_by_subtensor` /
-  `_hash_tokens` — 그대로.
-- `LMCBlenderBuilder` — 그대로 (단, Phase 4 는 새 `instance_id` 별로 fresh
-  blender 인스턴스를 만들기 위해 `_blenders` dict 를 method 마다 비운다).
+| Example | full | reuse | r=0.00 | r=0.05 | r=0.15 | r=0.30 | r=0.50 | r=1.00 |
+|---|---|---|---|---|---|---|---|---|
+| 2hop__482757_12019 | 1.00 | 0.22 | 0.22 | 0.22 | 0.00 | 0.00 | 0.00 | **1.00** |
+| 2hop__144408_215084 | 1.00 | 0.67 | 0.67 | 0.67 | 0.67 | **1.00** | **1.00** | **1.00** |
 
-### Phase 4 에서 추가한 HF 어댑테이션
+- **482757_12019**: r=0.15 가 reuse 보다 *오히려 나빠짐* (0.22 → 0.00).
+  중간 비율 (0.30, 0.50) 도 회복 못 함. r=1.00 만 회복.
+- **144408_215084**: r=0.30 부터 회복. 즉, 적은 양의 recomputation 으로
+  도 충분한 case.
 
-- `LMCFullReuseBlender`: `LMCBlender` 의 subclass. `process_qkv` 만 override.
-  - Pre-HKVD prefix 는 그대로 (attn_output 할당 + positions 초기화 + Q 회전).
-  - HKVD 브랜치는 통째로 제거.
-  - 반환은 `(q, old_k, old_v, residual, attn_output, attn_metadata)` — K, V
-    는 캐시된 (RoPE-shifted) 값을 그대로 사용. 새로 계산된 K 는 폐기.
-  - LMCache 원본에는 동일 클래스가 없다 (vLLM 예제도 Method 2 는
-    별도 구현). Phase 0 audit + Phase 4 prompt 의 spec 그대로 작성.
-- `unpatch_hf_model`: Phase 1 의 `LMCBaseModel.__init__` 가 HF model 을
-  in-place patch (qkv_proj / rotary_emb / o_proj wrapping / layernorm
-  wrapping) 한 후, `model.generate` 를 다시 사용하려면 원상복귀가
-  필요. 각 patch 가 `inner` 속성에 원본을 보관하므로 단순 역연산.
-- `connector_to_dyncache`: HF 의 `DynamicCache` 가 4-D `(B, H, T, D)` 를
-  쓰는 반면 우리 connector 는 2-D `(T, H*D)` 를 쓴다. shape 변환 후
-  `DynamicCache.update` 로 빈 캐시에 시드.
-- `decode_from_full_cache`: HF `generate` 가 입력 길이 == cache 길이 인
-  케이스를 거부하기 때문에, 캐시를 `L-1` 로 `crop` 한 뒤 last token 을
-  수동으로 forward 하고 max_new_tokens 회 greedy decode 하는 작은
-  decode 루프.
+### 4.4 Segment cache diagnostics (smoke n=5)
 
-### 토큰화 / 분리자 처리
+```
+- evaluated examples:                 5
+- all six chunks cache-hit:           5
+- real question segment cache-hit:    0   ✓ (의도된 MISS)
+- prefix cache-hit:                   5
+```
 
-- `sep_ids = tokenizer.encode(blend_special_str)[1:]` 그대로 (LMCache 의
-  `lmcache/v1/token_database.py:437-439` 와 동일).
-- 각 segment (prefix, 청크 6 개, question) 가 독립적으로 `[1:]` 토큰화.
-- 토큰 ID 리스트를 직접 이어붙임 (`prefix_ids + sep_ids + chunk_ids[i] +
-  sep_ids + ... + question_ids`).
-- 전체 prompt 를 문자열로 만든 뒤 한 번에 토큰화하는 방식을 사용하지
-  않는다.
-- 분리자 카운트: 정확히 `1 + num_chunks` 개 (= 7) 가 first 와 second
-  prompt 각각에 등장해야 한다는 invariant 를 `count_subsequence` 로 검증.
-- 내부 분리자 (segment 내부에 sep 토큰 sequence 가 포함된 경우) 는
-  skip / error policy 로 처리.
+→ Cache invariant 완벽 일치. real question segment 가 5/5 모두 MISS.
+의도된 RAG-cache 시나리오 그대로 동작.
 
-### 데이터셋 / 청크 정책
+### 4.5 Latency ratios (smoke n=5)
 
-- MuSiQue Answerable 만 사용 (`answerable == False` → skip).
-- 6 청크 per example. supporting 가 7 개 이상이면 skip (기본) / error.
-- supporting 가 6 개 미만이면 question-paragraph L2 거리가 가까운
-  non-supporting 으로 채움. tie-breaker 는 paragraph idx 오름차순.
-- supporting 의 `l2_distance_to_question = null`, non-supporting 은
-  실제 거리 저장.
-- per-example 결정적 RNG (`random.Random(f"{seed}:{example_id}")`) 로
-  6 청크를 한 번 셔플 → `first_order`.
-- `second_order = list(reversed(first_order))` — 두 prompt 는 청크 순서만
-  다르고 chunk 토큰 sequence, prefix, sep, question 은 동일.
+| Comparison | Ratio |
+|---|---|
+| Full KV reuse / Full recompute | 1.129 (reuse 가 약간 더 느림; cache-load + manual-tail overhead) |
+| CacheBlend r=0.00 / Full recompute | **0.543** |
+| CacheBlend r=0.05 / Full recompute | 0.569 |
+| CacheBlend r=0.15 / Full recompute | 0.603 |
+| CacheBlend r=0.30 / Full recompute | 0.745 |
+| CacheBlend r=0.50 / Full recompute | 0.798 |
+| CacheBlend r=1.00 / Full recompute | 1.145 |
 
-## 4. 작업 중 결정한 사항
+- r 이 증가할수록 latency 가 단조 증가 (cache reuse 의 이점이 줄어듦).
+- r=0.30 까지는 Full recompute 대비 25% 이상 빠름.
 
-### Method 1 vs Method 2/3 의 patch 라이프사이클
+### 4.6 N=100 main run
 
-- Method 1 (Full recompute) 은 stock HF API 만 사용 → model 을 patch 하지
-  않은 상태에서 실행.
-- Method 2 / 3 은 `LMCBlender(.__init__)` 가 model 을 in-place patch 한 뒤
-  blend 를 실행. blend 종료 후 `connector.get_kv` 에서 fused KV 를 뽑아
-  `DynamicCache` 로 변환한 뒤 **unpatch**.
-- unpatch 후 `model.generate` 또는 `decode_from_full_cache` 를 호출.
-- 다음 method (또는 다음 example) 가 시작할 때 다시 patch 가 일어난다.
+- 진행 중 (`results/phase4_musique_rerun_n100*.{md,jsonl}` 에 출력).
+- 동일 instance (vast.ai #37035954, RTX 3090).
+- 동일 ratio sweep (`0.0,0.05,0.15,0.30,0.50,1.00`).
+- 예상 소요: ~22 시간 (per-example ~13 분 × 100).
+- 완료 후 §4.2 / §4.3 / §4.4 / §4.5 의 표를 N=100 결과로 갱신.
 
-### `decode_from_full_cache` 의 cache-크롭 트릭
+## 5. 해석
 
-- CacheBlend 의 `blend()` 가 채운 GPU 버퍼는 prompt 전체 (`L` 토큰) 에
-  해당하는 KV 를 갖는다.
-- HF `generate(input_ids, past_key_values)` 는 `len(input_ids) == cache_len`
-  인 경우 "이미 다 캐시됐다" 며 forward 할 입력이 없어 에러를 낸다.
-- 우회: cache 를 `L-1` 로 `crop` 한 뒤 last prompt token 을 입력으로
-  forward → position `L-1` 의 logits 를 얻고, 이후 max_new_tokens 회
-  greedy decode.
+### 5.1 새 디자인이 핵심 invariant 통과
 
-### Embedding model fallback
+- 의도: real question segment 가 cache MISS 여야 한다.
+- 결과: 5/5 examples 에서 MISS ✓.
+- 의도: 6 chunks 가 cache HIT 여야 한다.
+- 결과: 5/5 examples 에서 HIT ✓.
 
-- `sentence-transformers/all-MiniLM-L6-v2` 로딩에 실패해도 (예: 패키지
-  미설치) 결정적 hash 기반 fake embedding 으로 fallback. 단위 테스트는
-  이 fallback 을 활용해 sentence-transformers 없이 동작.
+### 5.2 Sanity checks 통과
 
-### CLI default
+- r=0.00 vs Full KV reuse: gap +0.000 ✓
+- r=1.00 vs Full recompute: gap +0.000 ✓
+- 즉, CacheBlend 의 양 끝 (recompute 0% / 100%) 이 정확히 reuse / full
+  과 일치 → blender 의 token-selection 로직이 의도대로 동작.
 
-- `--num-chunks` 6 (spec 그대로)
-- `--blend-special-str "# #"` (spec 그대로)
-- `--max-new-tokens` 32
-- `--seed` 42
-- `--embedding-normalize false`
-- `--on-too-many-supporting skip`
-- `--on-internal-separator skip`
+### 5.3 Reuse 의 quality 손실이 실제로 측정됨
 
-## 5. 다음 Phase 준비도
+- 기존 (잘못된) 결과: reuse = blend (둘 다 cache hit on question).
+- 새 결과: reuse 는 full 대비 -0.22, blend r=1.00 은 full 과 동일.
+- CacheBlend ratio sweep 이 *실제로 의미 있는 회복 곡선* 을 그림.
 
-### 진행 가능 여부
+### 5.4 Ratio sweep 의 비단조성
 
-- Phase 4 의 모든 구현 코드는 commit `258c4df` 에 push 됨.
-- 단위 테스트 12/12 PASS, Phase 3 회귀 0건.
-- 통합 smoke 는 vast.ai 인스턴스 SSH 문제로 자동 실행이 미완료;
-  사용자 측에서 다음 박스에서 `scripts/run_phase4_remote.sh` 또는
-  `pytest tests/test_phase4_rag_quality.py::test_integration_smoke` 로
-  재실행 시 통합 결과 확보 가능.
+- F1: r=0.00 (0.578) → r=0.15 (0.533) → r=0.30 (0.600) → r=1.00 (0.800).
+- 중간 r=0.15 가 r=0.00 보다 나쁨. 의외였으나 작은 sample 임을 감안.
+- 가설: HKVD 가 "diffuse" 한 토큰만 recompute 하고 정작 정답을
+  결정짓는 위치를 놓치는 case 가 있음. r 이 충분히 크면 (≥0.30) 정답
+  결정 토큰을 포함시키게 되어 F1 회복.
+- N=100 에서 단조성 회복 여부를 확인할 예정.
 
-### 사용자 리뷰가 필요한 부분
+### 5.5 한계
 
-1. **Phase 1 / Phase 2 회귀** (§2 에서 자세히): Phase 3 의 blender
-   생성자 변경으로 Phase 1/2 의 stub-기반 테스트가 import 시점에
-   깨진다. 정리: `LMCStubBlender` 클래스를 별도 파일로 분리하거나
-   Phase 1/2 테스트를 새 생성자에 맞게 업데이트할 필요가 있다.
-2. **Default prefix 갱신** (§1 의 mid-flight 정책 반영): "shortest
-   possible phrase, no explanation" 으로 변경됨. F1 측정값은 이 prefix
-   기준이라는 점을 보고서에 명시.
-3. **통합 smoke 미실행**: vast.ai SSH 핸드셰이크 실패. 동일한 bootstrap
-   스크립트가 Phase 1-3 의 다른 인스턴스에서 정상 동작했으므로 host-
-   side 문제로 추정. 다음 GPU 박스에서 재시도 시 동작할 것.
+1. **N=5 sample variance**: 본 §4.2 은 preliminary. N=100 결과를
+   기다려야 통계적 의미 확보.
+2. **Mistral-7B-Instruct-v0.2 만 검증**: Llama-3.1-8B-Instruct 는 아직
+   미실행 (predict: 동일한 invariant 통과, 다른 F1 곡선).
+3. **Latency 측정의 노이즈**: vast.ai 인스턴스의 GPU 점유율이 100%
+   이지 않을 수 있음. p50 위주로 해석 권장.
+4. **CacheBlend 의 Pareto frontier**: r=0.30 이 Pareto-optimal 후보
+   이지만 N=5 에서는 너무 작은 sample. N=100 에서 ratio 별 F1 / latency
+   curve 의 elbow 위치를 확인 필요.
 
-### 알려진 잔여 리스크
+## 6. 다음 단계
 
-> **CacheBlend F1 갭 가설** (smoke 결과 측정 후 확인 필요):
-> 통합 smoke 결과 CacheBlend 와 Full recompute 의 F1 차이가 0.03 보다
-> 크게 벌어진다면 다음 가설을 우선 확인:
-> 1. **분리자 materialisation 불일치**: Mistral / Llama-3 의 토크나이저
->    가 " # # " 의 leading space 를 다르게 처리할 수 있다. `sep_ids` 의
->    실제 값을 per-example details 의 `tokenization.sep_ids` 에서 확인.
-> 2. **segment span 오류**: 청크 토큰 sequence 가 first / second prompt
->    에서 정확히 동일한지는 unit test `test_chunk_token_ids_identical_across_orders`
->    가 검증하지만 실모델 토크나이저로도 다시 확인 필요.
-> 3. **RoPE position-shift 문제**: Phase 3 §3.2 가 통과했으므로 forward
->    경로는 OK. backward 방향 (FusedRope.fused_encode 의
->    `cos_old → cos_new`) 의 정확도가 일부 layer 에서 떨어질 가능성.
-> 4. **HKVD top-index 이슈**: `recomp_ratios=[0.15]` 의 15% 가 의미상
->    충분한가? Phase 3 §3.6 의 cos sim ≥ 0.95 가 통과했으므로 답안
->    품질은 비슷해야 함.
-> 5. **답안 추출 / F1 정규화 이슈**: 모델이 prefix instruction 을
->    따르지 않고 길게 설명할 경우 F1 precision 이 낮음. mid-flight 정책
->    갱신이 이 부분을 완화했지만 효과는 smoke 측정 후에야 확인.
-> 6. **smoke sample 이 작음** (5-10 examples): variance 가 크다. spec 의
->    smoke gate (|ΔF1| ≤ 0.05) 는 통과해도 50+ examples 의 full run 이
->    필요.
+- [x] 단위 테스트 19/20 PASS (1 skipped CPU integration).
+- [x] N=5 smoke validation (cache invariant + sanity checks).
+- [ ] N=100 main run (진행 중).
+- [ ] N=100 결과로 §4.2 / §4.3 / §4.5 갱신.
+- [ ] (선택) Llama-3.1-8B-Instruct 으로 동일 실험 반복.
 
-### 참고 자료 리뷰 요약 (Step 0A / 0B)
+## 7. 참고
 
-- 본 리포지토리 (`README.md`, `docs/*.md`, `reports/phase0..3.md`,
-  `lmc/` Phase 1-3 source) 를 검토. Phase 3 에서 이미 `LMCBlender`,
-  `LMCacheEngine.store_from_prefill`, `HFBufferLayerwiseGPUConnector`,
-  `SegmentTokenDatabase`, `FusedRope`, `LMCBlenderBuilder` 가 완성되어
-  있어 Phase 4 는 이들을 재사용 + `LMCFullReuseBlender` 추가 + 데이터셋/
-  토큰화/F1/runtime 헬퍼만 신규로 작성하면 됐다.
-- LMCache reference (`/tmp/cacheblend-audit/LMCache_reference/`) 의
-  `examples/blend_kv_v1/blend.py:147-186` 을 다시 검토. 분리자가 단순
-  문자열이 아닌 `tokenizer.encode(...)[1:]` 의 토큰 ID sequence 임을
-  재확인. 본 Phase 4 의 Stage B 가 이 패턴을 그대로 따른다.
+- Commit `1b93f86` (Phase 4 rerun design)
+- Commit `d555986` (cache-hit prefix + manual miss-tail split)
+- 단위 테스트 / 통합 smoke: 모두 동일 commit 에서 PASS.
+- vast.ai 인스턴스 #37035954 — N=100 완료 후 destroy 예정.
 
----
-
-> Phase 4 의 코드 / 단위 테스트 / Korean 보고서는 모두 commit 된 상태.
-> 통합 smoke 만 vast.ai SSH 문제로 자동 실행이 막혔으므로 다음 GPU 박스
-> 에서 `scripts/run_phase4_remote.sh` 로 재실행 가능. **`phase4-complete`
-> tag 는 통합 smoke 의 quality gate (|ΔF1| ≤ 0.05) 가 PASS 한 뒤
-> 부여 권장**.
+작업 완료. 자세한 내용은 reports/phase4.md 참고.
