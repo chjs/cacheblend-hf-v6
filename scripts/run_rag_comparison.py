@@ -1,7 +1,13 @@
 """
-Phase 4 — MuSiQue RAG quality comparison for CacheBlend-HF.
+Phase 4 — RAG quality comparison for CacheBlend-HF.
 
-Compares prefill methods on MuSiQue Answerable:
+Two datasets are supported via `--dataset {musique,loong}`:
+  - MuSiQue Answerable: 6 chunks (supporting + nearest non-supporting
+    by L2). Shorter prompts.
+  - Loong: ~11 chunks per example, all provided documents used. Longer
+    prompts; intended to expose cache-miss recovery more clearly.
+
+Compares prefill methods on the second prompt of each example:
   1. Full KV recompute (stock HF prefill on the second prompt).
   2. Full KV reuse (Prompt Cache baseline: cached chunk KVs + RoPE
      shift, no recomputation).
@@ -9,9 +15,9 @@ Compares prefill methods on MuSiQue Answerable:
 
 The first prompt is a *warmup-only* prompt ending in a dummy query;
 its sole purpose is to populate per-chunk KV under the chunks' hashes.
-The second prompt ends in the *real* MuSiQue question and is the only
-prompt evaluated for F1. The real question segment must therefore be
-a cache MISS — segment-level diagnostics are written for every example.
+The second prompt ends in the *real* question and is the only prompt
+evaluated for F1. The real question segment must therefore be a cache
+MISS — segment-level diagnostics are written for every example.
 
 See docs/phases/PHASE4_PROMPT.md for the full spec.
 """
@@ -34,6 +40,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch  # noqa: E402
 
 from scripts._phase4_f1 import f1_with_aliases  # noqa: E402
+from scripts._phase4_loong import (               # noqa: E402
+    DEFAULT_LOONG_NUM_CHUNKS, assign_length_bucket, iter_loong_cases,
+    prompt_token_budget,
+)
 from scripts._phase4_musique import (             # noqa: E402
     DEFAULT_DUMMY_WARMUP_QUERY, DEFAULT_PREFIX, DEFAULT_QUESTION_TEMPLATE,
     iter_cases,
@@ -97,22 +107,26 @@ def parse_recompute_ratios(spec: str) -> List[float]:
 # CLI.
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 4 — MuSiQue RAG comparison")
+    p = argparse.ArgumentParser(description="Phase 4 — RAG comparison (MuSiQue / Loong)")
+    p.add_argument("--dataset", choices=["musique", "loong"], default="musique",
+                   help="Which dataset to evaluate against.")
     p.add_argument("--model", required=True, choices=[
         "mistralai/Mistral-7B-Instruct-v0.2",
         "meta-llama/Meta-Llama-3.1-8B-Instruct",
     ])
     p.add_argument("--input-jsonl", required=True,
-                   help="Path to musique_ans_v1.0_train.jsonl")
+                   help="Path to dataset JSONL. For MuSiQue: musique_ans_v1.0_train.jsonl. "
+                        "For Loong: loong.jsonl (or whatever conversion path).")
     p.add_argument("--num-examples", type=int, required=True,
-                   help="Maximum number of MuSiQue examples to USE (after skips).")
+                   help="Maximum number of examples to USE (after skips).")
     p.add_argument("--dtype", choices=["float16", "bfloat16"], required=True)
     p.add_argument("--output", required=True,
                    help="Path to write the aggregate markdown report.")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-new-tokens", type=int, default=32)
-    p.add_argument("--num-chunks", type=int, default=6)
+    p.add_argument("--num-chunks", type=int, default=6,
+                   help="Number of chunks for MuSiQue. Loong uses --loong-num-chunks.")
     p.add_argument("--blend-special-str", default="# #")
     p.add_argument("--embedding-model",
                    default="sentence-transformers/all-MiniLM-L6-v2")
@@ -126,12 +140,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--question-template", default=DEFAULT_QUESTION_TEMPLATE)
     p.add_argument("--dummy-warmup-query", default=DEFAULT_DUMMY_WARMUP_QUERY,
                    help="Trailing segment of the FIRST (warmup-only) prompt. "
-                        "Must differ from the real MuSiQue question.")
+                        "Must differ from the real question.")
     p.add_argument("--on-too-many-supporting", choices=["skip", "error"], default="skip")
     p.add_argument("--on-internal-separator", choices=["skip", "error"], default="skip")
     p.add_argument("--max-model-len", type=int, default=None,
                    help="If set, override the model's max position embedding for the "
-                        "prompt-fits-in-context check.")
+                        "prompt-fits-in-context check. For Loong + Mistral-7B-v0.2, "
+                        "defaults to 32768.")
+    p.add_argument("--safety-margin", type=int, default=128,
+                   help="Tokens reserved for generation overhead beyond max_new_tokens.")
     p.add_argument("--write-jsonl-details", default=None,
                    help="Optional path for per-example JSONL details.")
     p.add_argument("--cacheblend-check-layers", type=int, default=1)
@@ -139,6 +156,19 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated list of CacheBlend recompute ratios. "
                         "Default keeps Phase 4 baseline (`0.15`). Pass "
                         "`0.0,0.05,0.15,0.30,0.50,1.00` for the rerun sweep.")
+
+    # Loong-specific.
+    p.add_argument("--loong-num-chunks", type=int, default=DEFAULT_LOONG_NUM_CHUNKS,
+                   help="Number of chunks per Loong example.")
+    p.add_argument("--loong-first-order", choices=["original", "random"], default="original",
+                   help="First-prompt chunk order policy for Loong. "
+                        "Second order is always the exact reverse.")
+    p.add_argument("--loong-on-extra-chunks", choices=["first", "skip", "error"],
+                   default="first",
+                   help="If a Loong example has MORE than --loong-num-chunks chunks.")
+    p.add_argument("--loong-on-fewer-chunks", choices=["skip", "error", "use_all"],
+                   default="skip",
+                   help="If a Loong example has FEWER than --loong-num-chunks chunks.")
 
     return p.parse_args()
 
@@ -742,6 +772,9 @@ def _write_markdown(
     cacheblend_ratios: List[float],
     seg_diag_summary: Dict[str, Any],
     failure_subset: Dict[str, Any],
+    model_max_len: int,
+    budget: int,
+    bucket_per_method: Optional[Dict[str, Dict[str, Dict[str, List[float]]]]] = None,
 ) -> None:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -758,19 +791,32 @@ def _write_markdown(
         return float(mean(vals)) if vals else float("nan")
 
     lines: List[str] = []
-    lines.append("# Phase 4 — MuSiQue RAG comparison")
+    if args.dataset == "loong":
+        lines.append("# Phase 4 — Loong RAG comparison")
+    else:
+        lines.append("# Phase 4 — MuSiQue RAG comparison")
     lines.append("")
     lines.append(f"Model: `{args.model}`")
     lines.append(f"dtype: `{args.dtype}`")
+    lines.append(f"dataset: `{args.dataset}`")
     lines.append(f"input: `{args.input_jsonl}`")
     lines.append(f"num_examples_requested: {args.num_examples}")
     lines.append(f"num_examples_used: {used}")
     lines.append(f"num_examples_skipped: {skipped}")
     lines.append(f"seed: {args.seed}")
     lines.append(f"blend_special_str: `{args.blend_special_str}`")
-    lines.append(f"embedding_model: `{args.embedding_model}`")
-    lines.append(f"embedding_normalize: {args.embedding_normalize}")
+    if args.dataset == "musique":
+        lines.append(f"embedding_model: `{args.embedding_model}`")
+        lines.append(f"embedding_normalize: {args.embedding_normalize}")
+    if args.dataset == "loong":
+        lines.append(f"loong_num_chunks: {args.loong_num_chunks}")
+        lines.append(f"loong_first_order: {args.loong_first_order}")
+        lines.append(f"loong_on_extra_chunks: {args.loong_on_extra_chunks}")
+        lines.append(f"loong_on_fewer_chunks: {args.loong_on_fewer_chunks}")
+    lines.append(f"max_model_len: {model_max_len}")
     lines.append(f"max_new_tokens: {args.max_new_tokens}")
+    lines.append(f"safety_margin: {args.safety_margin}")
+    lines.append(f"prompt_token_budget: {budget}")
     lines.append(f"dummy_warmup_query: `{args.dummy_warmup_query}`")
     lines.append(f"cacheblend_recompute_ratios: `{','.join(f'{r:.2f}' for r in cacheblend_ratios)}`")
     lines.append("")
@@ -828,11 +874,36 @@ def _write_markdown(
         )
     lines.append("")
 
+    # ----- prompt length buckets (Loong only) -----
+    if args.dataset == "loong" and bucket_per_method:
+        lines.append("## Prompt length buckets")
+        lines.append("")
+        lines.append("| Bucket | n | Full F1 | Reuse F1 | r=0.15 F1 | Full ms | Reuse ms | r=0.15 ms |")
+        lines.append("|--------|---|---------|----------|-----------|---------|----------|-----------|")
+        bucket_order = ["0-8k", "8-16k", "16-24k", "24-32k", "over_budget"]
+        for bucket in bucket_order:
+            if bucket not in bucket_per_method:
+                continue
+            b = bucket_per_method[bucket]
+            n_b = len(b[METHOD_FULL_RECOMPUTE]["f1"])
+            f1_full_b = mean(b[METHOD_FULL_RECOMPUTE]["f1"]) if n_b else float("nan")
+            f1_reuse_b = mean(b[METHOD_FULL_KV_REUSE]["f1"]) if n_b else float("nan")
+            r015 = cacheblend_method_name(0.15)
+            f1_r015_b = mean(b[r015]["f1"]) if (r015 in b and b[r015]["f1"]) else float("nan")
+            lm_full = mean(b[METHOD_FULL_RECOMPUTE]["prefill_ms"]) if n_b else float("nan")
+            lm_reuse = mean(b[METHOD_FULL_KV_REUSE]["prefill_ms"]) if n_b else float("nan")
+            lm_r015 = mean(b[r015]["prefill_ms"]) if (r015 in b and b[r015]["prefill_ms"]) else float("nan")
+            lines.append(
+                f"| {bucket} | {n_b} | {f1_full_b:.4f} | {f1_reuse_b:.4f} | "
+                f"{f1_r015_b:.4f} | {lm_full:.1f} | {lm_reuse:.1f} | {lm_r015:.1f} |"
+            )
+        lines.append("")
+
     # ----- segment cache diagnostics -----
     lines.append("## Segment cache diagnostics")
     lines.append("")
     lines.append(f"- evaluated examples: {seg_diag_summary['num_evaluated']}")
-    lines.append(f"- all six chunks cache-hit: {seg_diag_summary['all_six_chunks_hit_count']}")
+    lines.append(f"- all chunks cache-hit: {seg_diag_summary['all_chunks_hit_count']}")
     lines.append(f"- real question segment cache-hit: {seg_diag_summary['real_question_hit_count']}")
     lines.append(f"- prefix cache-hit: {seg_diag_summary['prefix_hit_count']}")
     if seg_diag_summary["real_question_hit_count"] > 0:
@@ -946,9 +1017,26 @@ def main() -> int:
 
     model.config._phase4_blend_special_str = args.blend_special_str
 
-    model_max_len = args.max_model_len or getattr(model.config, "max_position_embeddings", 4096)
+    # Resolve effective context budget. For Loong + Mistral-7B-v0.2 we
+    # default to 32k (model's native max is 32768); for everything else
+    # we fall back to whatever the config exposes.
+    cfg_max = getattr(model.config, "max_position_embeddings", 4096)
+    if args.max_model_len is not None:
+        model_max_len = args.max_model_len
+    elif args.dataset == "loong":
+        model_max_len = min(32768, cfg_max) if cfg_max else 32768
+    else:
+        model_max_len = cfg_max
+    budget = prompt_token_budget(model_max_len, args.max_new_tokens, args.safety_margin)
+    print(
+        f"[phase4] dataset={args.dataset} model_max_len={model_max_len} "
+        f"max_new_tokens={args.max_new_tokens} safety_margin={args.safety_margin} "
+        f"prompt_token_budget={budget}"
+    )
 
-    embedder = _build_embedder(args.embedding_model, args.embedding_batch_size)
+    embedder = None
+    if args.dataset == "musique":
+        embedder = _build_embedder(args.embedding_model, args.embedding_batch_size)
 
     method_names: List[str] = [METHOD_FULL_RECOMPUTE, METHOD_FULL_KV_REUSE]
     for r in cacheblend_ratios:
@@ -962,8 +1050,10 @@ def main() -> int:
     used = 0
     skipped = 0
     real_question_hit_count = 0
-    all_six_hit_count = 0
+    all_chunks_hit_count = 0
     prefix_hit_count = 0
+    # Loong: per-bucket aggregates.
+    bucket_per_method: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
 
     details_fp = None
     if args.write_jsonl_details is not None:
@@ -971,18 +1061,34 @@ def main() -> int:
         details_fp = open(args.write_jsonl_details, "w", encoding="utf-8")
 
     try:
-        case_iter = iter_cases(
-            args.input_jsonl,
-            prefix_text=prefix,
-            blend_special_str=args.blend_special_str,
-            question_template=args.question_template,
-            dummy_warmup_query=args.dummy_warmup_query,
-            num_chunks=args.num_chunks,
-            seed=args.seed,
-            embedder=embedder,
-            embedding_normalize=embedding_normalize,
-            on_too_many_supporting=args.on_too_many_supporting,
-        )
+        if args.dataset == "musique":
+            case_iter = iter_cases(
+                args.input_jsonl,
+                prefix_text=prefix,
+                blend_special_str=args.blend_special_str,
+                question_template=args.question_template,
+                dummy_warmup_query=args.dummy_warmup_query,
+                num_chunks=args.num_chunks,
+                seed=args.seed,
+                embedder=embedder,
+                embedding_normalize=embedding_normalize,
+                on_too_many_supporting=args.on_too_many_supporting,
+            )
+        elif args.dataset == "loong":
+            case_iter = iter_loong_cases(
+                args.input_jsonl,
+                prefix_text=prefix,
+                blend_special_str=args.blend_special_str,
+                question_template=args.question_template,
+                dummy_warmup_query=args.dummy_warmup_query,
+                num_chunks=args.loong_num_chunks,
+                seed=args.seed,
+                first_order_policy=args.loong_first_order,
+                on_extra_chunks=args.loong_on_extra_chunks,
+                on_fewer_chunks=args.loong_on_fewer_chunks,
+            )
+        else:
+            raise ValueError(f"unknown dataset {args.dataset!r}")
 
         for case, skip_reason in case_iter:
             if case is None:
@@ -1008,7 +1114,8 @@ def main() -> int:
 
             total_first = len(materialized.first_prompt_ids)
             total_second = len(materialized.second_prompt_ids)
-            if max(total_first, total_second) + args.max_new_tokens > model_max_len:
+            # The full budget covers `prompt + max_new_tokens + safety_margin`.
+            if max(total_first, total_second) > budget:
                 skip_counts["prompt_too_long"] = skip_counts.get("prompt_too_long", 0) + 1
                 skipped += 1
                 continue
@@ -1043,9 +1150,36 @@ def main() -> int:
                     file=sys.stderr,
                 )
             if seg_diag.get("all_six_chunks_cache_hit"):
-                all_six_hit_count += 1
+                all_chunks_hit_count += 1
             if seg_diag.get("prefix_cache_hit"):
                 prefix_hit_count += 1
+
+            # Length bucket bookkeeping (used in the Loong markdown).
+            if args.dataset == "loong":
+                bucket = assign_length_bucket(total_second)
+                bucket_per_method.setdefault(bucket, {
+                    name: {"f1": [], "prefill_ms": []} for name in method_names
+                })
+                for name in method_names:
+                    if name in result["methods"]:
+                        bucket_per_method[bucket][name]["f1"].append(
+                            result["methods"][name]["f1"]
+                        )
+                        bucket_per_method[bucket][name]["prefill_ms"].append(
+                            result["methods"][name]["prefill_ms"]
+                        )
+
+            # Add length / budget metadata to the per-example JSONL output.
+            result["prompt_lengths"] = {
+                "first": total_first,
+                "second": total_second,
+                "max_model_len": model_max_len,
+                "max_new_tokens": args.max_new_tokens,
+                "safety_margin": args.safety_margin,
+                "prompt_token_budget": budget,
+            }
+            if args.dataset == "loong":
+                result["length_bucket"] = assign_length_bucket(total_second)
 
             if details_fp is not None:
                 # Strip generated_ids out before JSONL write (they're huge).
@@ -1074,7 +1208,7 @@ def main() -> int:
     seg_diag_summary = {
         "num_evaluated": used,
         "real_question_hit_count": real_question_hit_count,
-        "all_six_chunks_hit_count": all_six_hit_count,
+        "all_chunks_hit_count": all_chunks_hit_count,
         "prefix_hit_count": prefix_hit_count,
     }
     failure_subset = compute_failure_subset(per_example_records, method_names)
@@ -1086,6 +1220,9 @@ def main() -> int:
         cacheblend_ratios=cacheblend_ratios,
         seg_diag_summary=seg_diag_summary,
         failure_subset=failure_subset,
+        model_max_len=model_max_len,
+        budget=budget,
+        bucket_per_method=bucket_per_method if args.dataset == "loong" else None,
     )
 
     print(f"[phase4] wrote markdown → {args.output}")
